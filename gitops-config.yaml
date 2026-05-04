@@ -1,18 +1,35 @@
-# Git repository for application deployments.
-# Phase 1: Flux bootstraps from this URL (GitHub)
-# Phase 2: Repo is mirrored to in-cluster Forgejo, Flux switches to Forgejo
-gitops:
-  url: ssh://git@github.com/bjornmolin/wallet-local-gitops.git
-  branch: main
-  interval: 1m
-  # Public URL to mirror into Forgejo on first boot
-  forgejo_mirror: https://github.com/bjornmolin/wallet-local-gitops.git
-
-# Public GitHub repos to mirror into cluster Forgejo
-mirrors:
-  - url: https://github.com/diggsweden/wallet-r2ps.git
-    owner: diggsweden
-    name: wallet-r2ps
-
-# Container image builds (Forgejo Actions + Buildah + Cosign)
-builds: []
+# GitOps namespaces.
+#
+# Each entry creates:
+#   - a Kubernetes Namespace
+#   - a Flux GitRepository (HTTPS + PAT in Secret/gitops-credentials-<name>)
+#   - a Flux Kustomization that deploys the repo contents into the namespace
+#
+# An empty list means no namespaces are created and no Flux sources are
+# applied (the base infrastructure still comes up).
+#
+# Add an entry with:
+#   make namespace NAME=<ns> URL=<https-clone-url> \
+#                  GITOPS_USER=<user> GITOPS_TOKEN=<pat>
+#
+# Per-entry fields:
+#   name             (required) DNS-1123 label, used as the namespace name
+#   url              (required) HTTPS clone URL of the gitops repo
+#   branch           (optional) defaults to "main"
+#   interval         (optional) source poll interval, defaults to "1m"
+#   path             (optional) path inside the repo, defaults to "./"
+#   imageAutomation  (optional) if true, deploy a Flux ImageUpdateAutomation
+#                    that commits image tag bumps back to this entry's repo.
+#                    Requires the gitops repo to contain
+#                    `# {"$imagepolicy": "flux-system:<policy>"}` markers.
+#                    Defaults to false.
+#
+# Example:
+#   namespaces:
+#     - name: wallet
+#       url: https://github.com/diggsweden/wallet-local-gitops.git
+#       branch: main
+#       interval: 1m
+#       path: ./
+#       imageAutomation: true
+namespaces: []

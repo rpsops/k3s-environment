@@ -1,0 +1,68 @@
+{% for e in namespaces %}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ e.name }}
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: {{ e.name }}
+  namespace: flux-system
+spec:
+  interval: {{ e.interval | default('1m') }}
+  url: {{ e.url }}
+  ref:
+    branch: {{ e.branch | default('main') }}
+  secretRef:
+    name: gitops-credentials-{{ e.name }}
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: apps-{{ e.name }}
+  namespace: flux-system
+spec:
+  interval: 10m
+  targetNamespace: {{ e.name }}
+  path: {{ e.path | default('./') }}
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: {{ e.name }}
+{% if e.imageAutomation | default(false) %}
+---
+apiVersion: image.toolkit.fluxcd.io/v1
+kind: ImageUpdateAutomation
+metadata:
+  name: {{ e.name }}-image-update
+  namespace: flux-system
+spec:
+  interval: 1m
+  sourceRef:
+    kind: GitRepository
+    name: {{ e.name }}
+  git:
+    checkout:
+      ref:
+        branch: {{ e.branch | default('main') }}
+    commit:
+      author:
+        name: flux-image-automation
+        email: flux@dev.local
+      messageTemplate: |
+        chore(images): update image tags
+{% raw %}
+        {{range .Changed.Changes}}- {{.OldValue}} -> {{.NewValue}}
+        {{end}}
+{% endraw %}
+    push:
+      branch: {{ e.branch | default('main') }}
+  update:
+    path: {{ e.path | default('./') }}
+    strategy: Setters
+{% endif %}
+{% if not loop.last %}
+---
+{% endif %}
+{% endfor %}

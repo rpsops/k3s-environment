@@ -2,6 +2,9 @@
 cosign.key
 cosign.pub
 
+# Local-only state: exported sealed-secrets master key and cosign key
+.local/
+
 HELP.md
 .gradle
 build/

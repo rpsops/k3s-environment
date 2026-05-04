@@ -11,7 +11,11 @@ else
 NERDCTL := limactl shell k3s sudo nerdctl --address /run/k3s/containerd/containerd.sock
 endif
 
-.PHONY: setup up sync sync-apps reconcile mirror ci-secrets status stop clean help
+.PHONY: setup up sync sync-apps reconcile status stop clean help \
+	namespace \
+	sealed-secrets-key-export sealed-secrets-key-restore \
+	cosign-key-export cosign-key-restore \
+	gitops-credentials-export gitops-credentials-restore
 
 ## One-time system setup (requires sudo): install tools, configure dnsmasq
 setup:
@@ -32,17 +36,17 @@ sync:
 	kubectl apply -k flux/infrastructure/monitoring/
 	kubectl apply -k flux/infrastructure/strimzi/
 	kubectl apply -k flux/infrastructure/registry/
-	kubectl apply -k flux/infrastructure/forgejo/
 	kubectl apply -k flux/infrastructure/kyverno/
 	kubectl apply -k flux/infrastructure/builds/
 
-## Force Flux to re-pull from the gitops repo and reconcile apps
+## Force Flux to re-pull every gitops repo and reconcile every apps-* Kustomization
 sync-apps:
-	flux reconcile source git wallet-local-gitops
-	flux reconcile kustomization apps-kafka-cluster
-	flux reconcile kustomization apps-kafbat
-	flux reconcile kustomization apps-valkey
-	flux reconcile kustomization apps-headlamp
+	@for s in $$(flux get sources git --no-header 2>/dev/null | awk '{print $$1}'); do \
+		flux reconcile source git $$s; \
+	done
+	@for k in $$(flux get kustomizations --no-header 2>/dev/null | awk '/^apps-/ {print $$1}'); do \
+		flux reconcile kustomization $$k; \
+	done
 
 ## Force Flux to reconcile HelmReleases immediately
 reconcile:
@@ -55,55 +59,110 @@ reconcile:
 	flux reconcile helmrelease vector -n monitoring
 	flux reconcile helmrelease strimzi-kafka-operator -n kafka
 	flux reconcile helmrelease zot -n registry
-	flux reconcile helmrelease forgejo -n forgejo
 	flux reconcile helmrelease kyverno -n kyverno
 	flux reconcile helmrelease kafbat-ui -n default
 	flux reconcile helmrelease valkey -n default
 
-## Mirror public GitHub repos to cluster Forgejo (reads gitops-config.yaml)
-mirror:
-	@ADMIN_PW=$$(kubectl get secret forgejo-admin -n forgejo -o jsonpath='{.data.password}' | base64 -d) && \
-	AUTH=$$(printf 'forgejo_admin:%s' "$$ADMIN_PW" | base64) && \
-	EXEC="kubectl exec -n forgejo deploy/forgejo -c forgejo --" && \
-	COUNT=$$(yq '.mirrors | length' gitops-config.yaml) && \
-	for i in $$(seq 0 $$((COUNT - 1))); do \
-		URL=$$(yq ".mirrors[$$i].url" gitops-config.yaml) && \
-		OWNER=$$(yq ".mirrors[$$i].owner" gitops-config.yaml) && \
-		NAME=$$(yq ".mirrors[$$i].name" gitops-config.yaml) && \
-		echo "--- Mirroring $$OWNER/$$NAME ---" && \
-		$$EXEC wget -qO /dev/null --post-data="{\"username\":\"$$OWNER\",\"visibility\":\"public\",\"full_name\":\"$$OWNER\"}" \
-			--header="Content-Type: application/json" \
-			--header="Authorization: Basic $$AUTH" \
-			http://localhost:3000/api/v1/orgs 2>/dev/null || true && \
-		if $$EXEC wget -qO /dev/null \
-			--header="Authorization: Basic $$AUTH" \
-			http://localhost:3000/api/v1/repos/$$OWNER/$$NAME 2>/dev/null; then \
-			echo "  Already exists, skipping"; \
-		else \
-			echo "  Creating mirror..." && \
-			$$EXEC wget -qO- --post-data="{\"clone_addr\":\"$$URL\",\"repo_name\":\"$$NAME\",\"repo_owner\":\"$$OWNER\",\"service\":\"github\",\"mirror\":false}" \
-				--header="Content-Type: application/json" \
-				--header="Authorization: Basic $$AUTH" \
-				http://localhost:3000/api/v1/repos/migrate && \
-			echo "  Done"; \
-		fi; \
-	done
+## Add a new gitops namespace entry to gitops-config.yaml + write credentials
+##
+## Usage:
+##   make namespace NAME=<ns> URL=<https-clone-url> \
+##                  GITOPS_USER=<user> GITOPS_TOKEN=<pat> \
+##                  [BRANCH=main] [INTERVAL=1m] [PATH_IN_REPO=./] \
+##                  [IMAGE_AUTOMATION=true]
+namespace:
+	@./scripts/add-namespace.sh
 
-## Push cosign key to Forgejo org secrets for CI signing
-ci-secrets:
-	@COSIGN_KEY=$$(kubectl get secret cosign-key -n flux-system -o jsonpath='{.data.cosign\.key}') && \
-	ADMIN_PW=$$(kubectl get secret forgejo-admin -n forgejo -o jsonpath='{.data.password}' | base64 -d) && \
-	EXEC="kubectl exec -n forgejo deploy/forgejo -c forgejo --" && \
-	COUNT=$$(yq '.mirrors | length' gitops-config.yaml) && \
-	for i in $$(seq 0 $$((COUNT - 1))); do \
-		OWNER=$$(yq ".mirrors[$$i].owner" gitops-config.yaml) && \
-		echo "--- Setting cosign secrets for org $$OWNER ---" && \
-		$$EXEC curl -sf -X PUT -u "forgejo_admin:$$ADMIN_PW" \
-			-H "Content-Type: application/json" \
-			-d "{\"data\":\"$$COSIGN_KEY\",\"visibility\":\"all\"}" \
-			http://localhost:3000/api/v1/orgs/$$OWNER/actions/secrets/COSIGN_PRIVATE_KEY > /dev/null && \
-		echo "  Done"; \
-	done
+## Re-write a single namespace's PAT Secret manifest
+##
+## Usage:
+##   make gitops-credentials-export NAME=<ns> GITOPS_USER=<user> GITOPS_TOKEN=<pat>
+##
+## The PAT needs repo read + write (write is required by Flux Image
+## Update Automation). Stored locally; not committed.
+gitops-credentials-export:
+	@if [ -z "$(NAME)" ] || [ -z "$(GITOPS_USER)" ] || [ -z "$(GITOPS_TOKEN)" ]; then \
+		echo "ERROR: set NAME, GITOPS_USER, and GITOPS_TOKEN" >&2; \
+		echo "  e.g. make gitops-credentials-export NAME=wallet GITOPS_USER=alice GITOPS_TOKEN=ghp_..." >&2; \
+		exit 1; \
+	fi
+	@mkdir -p .local
+	@kubectl create secret generic gitops-credentials-$(NAME) \
+		-n flux-system \
+		--from-literal=username='$(GITOPS_USER)' \
+		--from-literal=password='$(GITOPS_TOKEN)' \
+		--dry-run=client -o yaml > .local/gitops-credentials-$(NAME).yaml
+	@chmod 600 .local/gitops-credentials-$(NAME).yaml
+	@echo "Wrote .local/gitops-credentials-$(NAME).yaml (mode 600)"
+
+## Apply every saved gitops-credentials Secret in .local/
+gitops-credentials-restore:
+	@found=0; \
+	for f in .local/gitops-credentials-*.yaml; do \
+		[ -e "$$f" ] || continue; \
+		found=1; \
+		kubectl apply -f "$$f"; \
+	done; \
+	if [ $$found -eq 0 ]; then \
+		echo "ERROR: no .local/gitops-credentials-*.yaml found" >&2; \
+		echo "       Run 'make namespace NAME=... URL=... GITOPS_USER=... GITOPS_TOKEN=...' first." >&2; \
+		exit 1; \
+	fi
+
+## Export the sealed-secrets master key Secret to .local/ for restore on rebuild
+sealed-secrets-key-export:
+	@mkdir -p .local
+	@COUNT=$$(kubectl get secret -n kube-system \
+		-l sealedsecrets.bitnami.com/sealed-secrets-key=active \
+		-o name 2>/dev/null | wc -l | tr -d ' ') && \
+	if [ "$$COUNT" -eq 0 ]; then \
+		echo "ERROR: no active sealed-secrets key found in kube-system" >&2; \
+		echo "       (label sealedsecrets.bitnami.com/sealed-secrets-key=active)" >&2; \
+		exit 1; \
+	elif [ "$$COUNT" -gt 1 ]; then \
+		echo "ERROR: multiple active sealed-secrets keys found ($$COUNT); aborting" >&2; \
+		exit 1; \
+	fi
+	@kubectl get secret -n kube-system \
+		-l sealedsecrets.bitnami.com/sealed-secrets-key=active \
+		-o yaml | \
+		yq 'del(.items[].metadata.resourceVersion, .items[].metadata.uid, .items[].metadata.creationTimestamp, .items[].metadata.managedFields, .items[].metadata.ownerReferences) | .items[0]' \
+		> .local/sealed-secrets-master.key.yaml
+	@chmod 600 .local/sealed-secrets-master.key.yaml
+	@echo "Wrote .local/sealed-secrets-master.key.yaml (mode 600)"
+
+## Restore the sealed-secrets master key from .local/ and restart the controller
+sealed-secrets-key-restore:
+	@if [ ! -f .local/sealed-secrets-master.key.yaml ]; then \
+		echo "ERROR: .local/sealed-secrets-master.key.yaml not found" >&2; \
+		echo "       Run 'make sealed-secrets-key-export' on a working cluster first." >&2; \
+		exit 1; \
+	fi
+	kubectl apply -f .local/sealed-secrets-master.key.yaml
+	kubectl rollout restart deploy/sealed-secrets -n kube-system
+	kubectl rollout status  deploy/sealed-secrets -n kube-system --timeout=120s
+
+## Export the cosign signing key Secret to .local/ for restore on rebuild
+cosign-key-export:
+	@mkdir -p .local
+	@if ! kubectl get secret cosign-key -n flux-system >/dev/null 2>&1; then \
+		echo "ERROR: Secret/cosign-key not found in flux-system" >&2; \
+		exit 1; \
+	fi
+	@kubectl get secret cosign-key -n flux-system -o yaml | \
+		yq 'del(.metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.managedFields, .metadata.ownerReferences)' \
+		> .local/cosign-key.yaml
+	@chmod 600 .local/cosign-key.yaml
+	@echo "Wrote .local/cosign-key.yaml (mode 600)"
+
+## Restore the cosign signing key from .local/
+cosign-key-restore:
+	@if [ ! -f .local/cosign-key.yaml ]; then \
+		echo "ERROR: .local/cosign-key.yaml not found" >&2; \
+		echo "       Run 'make cosign-key-export' on a working cluster first." >&2; \
+		exit 1; \
+	fi
+	kubectl apply -f .local/cosign-key.yaml
 
 ## Show Flux status
 status:
@@ -164,10 +223,15 @@ help:
 	@echo "  setup      - One-time system setup (requires sudo): tools + dnsmasq"
 	@echo "  up         - Start k3s and deploy via Flux (no sudo)"
 	@echo "  sync       - Re-apply infrastructure Flux manifests"
-	@echo "  sync-apps  - Force Flux to re-pull gitops repo and reconcile apps"
+	@echo "  sync-apps  - Force Flux to re-pull every gitops repo and reconcile apps"
 	@echo "  reconcile  - Force Flux to reconcile HelmReleases immediately"
-	@echo "  mirror     - Mirror public GitHub repos to cluster Forgejo"
-	@echo "  ci-secrets - Push cosign key to Forgejo org secrets for CI"
+	@echo "  namespace  - Add a gitops namespace entry (NAME, URL, GITOPS_USER, GITOPS_TOKEN; opt: IMAGE_AUTOMATION=true)"
+	@echo "  gitops-credentials-export  - Re-write .local/gitops-credentials-<NAME>.yaml"
+	@echo "  gitops-credentials-restore - Apply every saved gitops-credentials Secret"
+	@echo "  sealed-secrets-key-export  - Save active sealed-secrets master key to .local/"
+	@echo "  sealed-secrets-key-restore - Apply saved sealed-secrets key + restart controller"
+	@echo "  cosign-key-export          - Save cluster cosign signing key to .local/"
+	@echo "  cosign-key-restore         - Apply saved cosign signing key"
 	@echo "  status     - Show Flux sources, kustomizations, and HelmReleases"
 	@echo "  stop       - Stop k3s (preserves data)"
 	@echo "  clean      - Destroy k3s completely"

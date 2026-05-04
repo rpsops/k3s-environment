@@ -7,5 +7,4 @@ resources:
   - cert-manager.yaml
   - registry.yaml
   - garage.yaml
-  - forgejo.yaml
   - kyverno.yaml

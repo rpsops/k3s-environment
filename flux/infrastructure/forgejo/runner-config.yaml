@@ -1,9 +1,0 @@
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: forgejo-runner-config
-  namespace: forgejo
-data:
-  config.yaml: |
-    log:
-      level: info

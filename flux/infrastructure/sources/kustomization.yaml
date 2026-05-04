@@ -12,5 +12,4 @@ resources:
   - zot.yaml
   - vector.yaml
   - garage.yaml
-  - forgejo.yaml
   - kyverno.yaml
