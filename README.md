@@ -36,6 +36,144 @@ make setup
 make up
 ```
 
+For a full end-to-end walkthrough including key persistence and per-fork
+app deploy, see [From zero to a running fork](#from-zero-to-a-running-fork)
+below.
+
+## From zero to a running fork
+
+End-to-end procedure covering host prerequisites, cluster bring-up, key
+persistence, and per-fork app deploy. Follow phases in order; each phase
+is idempotent and safe to re-run.
+
+### Phase 0 — Host prerequisites (one-time per developer)
+
+1. Install host tools: `make`, `ansible` (with `community.general`),
+   plus on macOS Xcode CLT (`xcode-select --install`) and Lima.
+   `make setup` installs the rest (`kubectl`, `helm`, `flux`, `mkcert`,
+   `cosign`, `kubeseal`, `dnsmasq`).
+2. After `make setup`, run `mkcert -install` if it wasn't already — this
+   trusts the mkcert root CA in your system + browsers so
+   `*.dev.local` certs validate.
+3. Fork `wallet-local-gitops` into your own org/user (one fork per
+   isolated app stack you want to run side-by-side).
+4. Create a PAT on the git host with **repo read + write** scope
+   (write is required so Flux Image Automation can commit tag bumps).
+5. Export creds for the bring-up shell:
+   ```bash
+   export GITOPS_USER=<git-user>
+   export GITOPS_TOKEN=<pat>
+   ```
+
+### Phase 1 — Restore-or-fresh decision (before `make up`)
+
+Check `.local/` for keys carried over from a prior cluster:
+
+```
+.local/
+├── sealed-secrets-master.key.yaml   # CRITICAL — restore to keep committed SealedSecrets decryptable
+├── cosign-key.yaml                  # CRITICAL — restore to keep prior image signatures valid
+└── gitops-credentials-<name>.yaml   # one per gitops-config.yaml entry
+```
+
+If you have these from a previous environment, drop them in `.local/`
+now (mode 600). Ansible picks them up automatically and skips
+regeneration. Missing files are fine for a brand-new setup — fresh keys
+will be generated and you'll persist them in Phase 3.
+
+### Phase 2 — Cluster bring-up (`make up`)
+
+`make up` runs the Ansible flow in this order:
+
+1. Gateway API CRDs → Cilium CNI → Flux (with image-automation
+   components).
+2. cert-manager → `mkcert-ca` Secret from host CAROOT → `mkcert`
+   ClusterIssuer.
+3. **Sealed-secrets controller** — restores key from
+   `.local/sealed-secrets-master.key.yaml` if absent in cluster, else
+   lets the controller generate a fresh one.
+4. **Grafana admin** — auto-generates `openssl rand -base64 16`, seals
+   it, applies (only if absent in cluster).
+5. Infrastructure pass 1 (garage, monitoring, strimzi, registry,
+   kyverno) → wait for HelmReleases to converge → pass 2 (cilium,
+   monitoring re-apply now that CRDs exist).
+6. dnsmasq Gateway IP update (Linux only).
+7. For each `gitops-config.yaml` entry: restore
+   `gitops-credentials-<name>` from `.local/` (or fail fast with a
+   `make namespace` hint), then render and apply Namespace +
+   GitRepository + Kustomization (+ ImageUpdateAutomation if
+   `imageAutomation: true`).
+8. Build infrastructure (`flux/infrastructure/builds/`) →
+   **cosign key**: restore from `.local/cosign-key.yaml` if absent,
+   else `cosign generate-key-pair k8s://flux-system/cosign-key`.
+
+### Phase 3 — Persist newly-generated keys
+
+Run after the **first** successful `make up` (and any time keys are
+regenerated):
+
+```bash
+make sealed-secrets-key-export   # → .local/sealed-secrets-master.key.yaml (mode 600)
+make cosign-key-export           # → .local/cosign-key.yaml (mode 600)
+```
+
+`.local/` is gitignored. The files contain **private keys** —
+distribute out-of-band (1Password, age/sops, etc.) if multiple
+developers share the same cluster identity.
+
+If the cosign key was freshly generated (no prior `.local/cosign-key.yaml`),
+also update the public key embedded in
+`flux/infrastructure/kyverno/verify-internal-images.yaml` and re-sign
+all images (`make -C ../wallet-r2ps push-bff push-hsm`) — otherwise
+Kyverno will reject pulls.
+
+### Phase 4 — Per-fork app deploy
+
+In each fork of `wallet-local-gitops` you want to run:
+
+1. **Re-seal hsm-worker secrets for the fork's namespace** (one-time,
+   then commit). SealedSecret payloads are namespace-bound, so a fork
+   targeting namespace `<fork-ns>` needs its own re-seal:
+   ```bash
+   # Source plaintext lives in wallet-r2ps (NOT committed):
+   #   .env.softhsm  →  Secret/hsm-worker-softhsm
+   #   .env.opaque   →  Secret/hsm-worker-opaque
+   kubectl create secret generic hsm-worker-softhsm \
+     --namespace=<fork-ns> --from-env-file=../wallet-r2ps/.env.softhsm \
+     --dry-run=client -o yaml \
+     | kubeseal --controller-namespace=kube-system -o yaml \
+     > apps/hsm-worker/sealed-secrets.yaml
+   # Repeat for hsm-worker-opaque and merge both SealedSecrets into
+   # apps/hsm-worker/sealed-secrets.yaml, then commit + push.
+   ```
+2. Add an entry to `gitops-config.yaml` and run
+   `make namespace NAME=<fork-ns> URL=<fork-url> GITOPS_USER=… GITOPS_TOKEN=…`.
+   This appends the entry, writes `.local/gitops-credentials-<fork-ns>.yaml`,
+   and applies the Secret + Namespace + GitRepository + Kustomization.
+3. Valkey password (auto-generated by the Bitnami chart) and
+   `kafka-tls` (issued by cert-manager) come up automatically inside
+   the namespace — no manual handling.
+4. Bootstrap images on first boot (StatefulSets reference a
+   `:test-0-placeholder` tag that doesn't exist yet):
+   ```bash
+   make -C ../wallet-r2ps cosign-key
+   make -C ../wallet-r2ps push-all
+   ```
+   Entries with `imageAutomation: true` will get the tag bump committed
+   to the fork repo automatically; without it, edit the manifests by
+   hand.
+
+### Failure-mode quick reference
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `SealedSecret` won't decrypt (`no key could decrypt secret`) | Master key changed since payload was sealed | Restore `.local/sealed-secrets-master.key.yaml` and `kubectl rollout restart deploy/sealed-secrets -n kube-system`, or re-seal payloads against the new key |
+| Kyverno blocks image pull (`signature verification failed`) | cosign key regenerated, pubkey in policy stale | Update pubkey in `flux/infrastructure/kyverno/verify-internal-images.yaml` + re-push & re-sign images |
+| BFF crashloops on Redis auth after valkey reinstall | Bitnami chart regenerated `valkey-password` | `kubectl rollout restart statefulset wallet-bff -n <fork-ns>` |
+| Flux can't pull fork repo | PAT expired or missing write scope | Recreate `gitops-credentials-<name>` (`make namespace` again with new token) |
+| `*.dev.local` cert untrusted in browser/curl | mkcert root CA not in host/VM trust store | `mkcert -install` on host; on Lima VM re-run `make setup` |
+| `make up` fails with "gitops-credentials-X missing both in-cluster and on disk" | New entry in `gitops-config.yaml` without matching `.local/` file | `make namespace NAME=X URL=… GITOPS_USER=… GITOPS_TOKEN=…` |
+
 ## Make Targets
 
 | Target | Description | Sudo |
@@ -144,49 +282,39 @@ Entries with `imageAutomation` unset or `false` get no
 `ImageUpdateAutomation` resource; image tag bumps in their gitops repo
 remain manual.
 
-## Persisting cluster keys across rebuilds
+## Cluster-generated keys reference
 
-Two cluster-generated keys must survive `make clean` + `make up` so that
-in-repo material keeps working after a cluster rebuild:
+Two cluster-generated keys must survive `make clean` + `make up`. Both
+are handled automatically by Phases 1–3 of [From zero to a running
+fork](#from-zero-to-a-running-fork); this section is a reference for
+manual ops.
 
-| Key | Why it matters |
-|-----|----------------|
-| **sealed-secrets master key** (`Secret` in `kube-system`, label `sealedsecrets.bitnami.com/sealed-secrets-key=active`) | The controller needs this RSA keypair to decrypt every `SealedSecret` you commit to `wallet-local-gitops`. If it changes, all sealed payloads must be re-sealed. |
-| **cosign signing key** (`Secret/cosign-key` in `flux-system`) | Used by the build pipeline (e.g. `make push-bff` / `make push-hsm` in `wallet-r2ps`) to sign images. Kyverno's `verify-internal-images` ClusterPolicy verifies signatures against the public key embedded in `flux/infrastructure/kyverno/verify-internal-images.yaml`. If the keypair changes, all previously-pushed image signatures fail verification. |
+| Key | Location | Why it matters |
+|-----|----------|----------------|
+| **sealed-secrets master key** | `Secret` in `kube-system`, label `sealedsecrets.bitnami.com/sealed-secrets-key=active` | Decrypts every `SealedSecret` committed to `wallet-local-gitops` forks. If lost, all sealed payloads must be re-sealed against the new key. |
+| **cosign signing key** | `Secret/cosign-key` in `flux-system` | Signs images pushed by `wallet-r2ps`'s `make push-bff`/`push-hsm`. Kyverno's `verify-internal-images` ClusterPolicy verifies against the pubkey in `flux/infrastructure/kyverno/verify-internal-images.yaml`. If regenerated, update the pubkey + re-sign all images. |
 
-### One-time export (after first successful `make up`)
-
-```bash
-make sealed-secrets-key-export   # writes .local/sealed-secrets-master.key.yaml (mode 600)
-make cosign-key-export           # writes .local/cosign-key.yaml (mode 600)
-```
-
-`.local/` is gitignored. The files contain **private keys** — distribute
-out-of-band (1Password, age/sops, etc.) if more than one developer needs
-the same cluster identity.
-
-### Automatic restore on `make up`
-
-Subsequent `make up` runs auto-restore both keys from `.local/` **only
-if** the corresponding Secret is missing in the cluster (so a freshly
-rotated or re-generated in-cluster key is never clobbered). When no
-saved file is present, Ansible logs a friendly notice and the cluster
-generates fresh keys as before.
-
-### Manual restore
+### Manual export / restore
 
 ```bash
-make sealed-secrets-key-restore  # applies + restarts the controller
-make cosign-key-restore          # applies the cosign Secret
+make sealed-secrets-key-export   # → .local/sealed-secrets-master.key.yaml (mode 600)
+make sealed-secrets-key-restore  # apply + restart controller
+
+make cosign-key-export           # → .local/cosign-key.yaml (mode 600)
+make cosign-key-restore          # apply Secret
 ```
+
+Auto-restore on `make up` only fires when the corresponding Secret is
+**missing** in the cluster, so a freshly rotated in-cluster key is
+never clobbered by an old `.local/` file.
 
 ### Limitations
 
 - Only the **active** sealed-secrets key is captured. If key rotation is
   ever enabled, retired decryption keys are not preserved.
 - The Kyverno public key is committed in
-  `flux/infrastructure/kyverno/verify-internal-images.yaml`. If you
-  generate a brand-new cosign key (i.e. start without `.local/cosign-key.yaml`),
+  `flux/infrastructure/kyverno/verify-internal-images.yaml`. If a brand
+  new cosign key is generated (no prior `.local/cosign-key.yaml`),
   update that file too — otherwise newly-signed images won't verify.
 
 ## Endpoints
