@@ -25,17 +25,18 @@ containerd:
 
 # Port forwarding for k8s services
 portForwards:
-  # Kubernetes API server
+  # Kubernetes API server — bound to 0.0.0.0 so k3s-toolbox container can reach it via host.docker.internal
   - guestPort: 6443
     hostPort: 6443
+    hostIP: "0.0.0.0"
     proto: tcp
-  # HTTP ingress
-  - guestPort: 80
-    hostPort: 80
+  # HTTP ingress — unprivileged so Lima can bind without root
+  - guestPort: 8080
+    hostPort: 8080
     proto: tcp
-  # HTTPS ingress
-  - guestPort: 443
-    hostPort: 443
+  # HTTPS ingress — unprivileged so Lima can bind without root
+  - guestPort: 8443
+    hostPort: 8443
     proto: tcp
 
 # Provisioning scripts to install and configure k3s
@@ -46,6 +47,44 @@ provision:
       #!/bin/bash
       set -eux -o pipefail
       
+      # Install socat for gateway port forwarding
+      apt-get install -y --no-install-recommends socat
+
+      # Systemd services that bridge Lima's port-forwarded ports to the
+      # Cilium Gateway IP. The script polls k3s until the Gateway has an
+      # IP, then hands off to socat.
+      cat > /usr/local/bin/k3s-port-forward.sh << 'SCRIPT'
+#!/bin/bash
+PORT=$1
+while true; do
+  GW=$(kubectl --kubeconfig=/etc/rancher/k3s/k3s.yaml \
+    get svc cilium-gateway-dev-local -n default \
+    -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
+  [ -n "$GW" ] && [ "$GW" != "None" ] && \
+    exec socat "TCP-LISTEN:${PORT},fork,bind=127.0.0.1,reuseaddr" "TCP:${GW}:${PORT}"
+  sleep 5
+done
+SCRIPT
+      chmod +x /usr/local/bin/k3s-port-forward.sh
+
+      for PORT in 8080 8443; do
+        cat > /etc/systemd/system/k3s-port-forward-${PORT}.service << EOF
+[Unit]
+Description=Forward port ${PORT} to Cilium Gateway
+After=k3s.service
+Wants=k3s.service
+
+[Service]
+ExecStart=/usr/local/bin/k3s-port-forward.sh ${PORT}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl enable k3s-port-forward-${PORT}
+      done
+
       # Increase inotify limits for in-cluster services
       echo "fs.inotify.max_user_instances=512" > /etc/sysctl.d/99-inotify.conf
       echo "fs.inotify.max_user_watches=524288" >> /etc/sysctl.d/99-inotify.conf
@@ -54,7 +93,7 @@ provision:
       # Install k3s if not already installed
       if [ ! -f /usr/local/bin/k3s ]; then
         echo "Installing k3s..."
-        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable=traefik --disable=servicelb --flannel-backend=none --disable-network-policy --disable-kube-proxy --write-kubeconfig-mode 644" sh -
+        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable=traefik --disable=servicelb --flannel-backend=none --disable-network-policy --disable-kube-proxy --write-kubeconfig-mode 644 --tls-san host.docker.internal" sh -
       else
         echo "k3s already installed, skipping..."
       fi

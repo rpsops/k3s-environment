@@ -11,13 +11,6 @@
   register: gwapi_apply
   changed_when: "'configured' in gwapi_apply.stdout or 'created' in gwapi_apply.stdout"
 
-- name: Flush stale Cilium iptables rules (Linux)
-  ansible.builtin.shell: |
-    sudo iptables -t nat -F OLD_CILIUM_POST_nat 2>/dev/null || true
-    sudo iptables -t nat -X OLD_CILIUM_POST_nat 2>/dev/null || true
-  changed_when: false
-  when: ansible_facts['os_family'] == "Debian"
-
 - name: Check if Cilium is installed
   ansible.builtin.command: helm status cilium -n kube-system
   register: cilium_check
@@ -88,33 +81,23 @@
   register: ns_apply
   changed_when: "'configured' in ns_apply.stdout or 'created' in ns_apply.stdout"
 
-- name: Flush stale Cilium iptables rules before Helm fetches (Linux)
-  ansible.builtin.shell: |
-    sudo iptables -t nat -F OLD_CILIUM_POST_nat 2>/dev/null || true
-    sudo iptables -t nat -X OLD_CILIUM_POST_nat 2>/dev/null || true
-  changed_when: false
-  when: ansible_facts['os_family'] == "Debian"
-
 - name: Force reconcile all Helm repositories
   ansible.builtin.shell: |
     flux reconcile source helm --all 2>/dev/null || true
     sleep 5
   changed_when: false
 
-- name: Verify DNS works inside cluster (Linux)
+- name: Verify DNS works inside cluster
   ansible.builtin.shell: |
     kubectl run dns-verify --rm -i --restart=Never --image=busybox --timeout=30s -- \
       nslookup charts.jetstack.io 2>&1 | tail -3
   register: dns_verify
   changed_when: false
   failed_when: false
-  when: ansible_facts['os_family'] == "Debian"
 
-- name: Fix CoreDNS if DNS is broken (Linux)
-  when: "ansible_facts['os_family'] == 'Debian' and dns_verify.rc is defined and dns_verify.rc != 0"
+- name: Fix CoreDNS if DNS is broken
+  when: "dns_verify.rc is defined and dns_verify.rc != 0"
   ansible.builtin.shell: |
-    sudo iptables -t nat -F OLD_CILIUM_POST_nat 2>/dev/null || true
-    sudo iptables -t nat -X OLD_CILIUM_POST_nat 2>/dev/null || true
     kubectl rollout restart daemonset cilium -n kube-system
     kubectl rollout restart deployment coredns -n kube-system
     sleep 20
@@ -140,6 +123,14 @@
   register: mkcert_caroot
   changed_when: false
 
+- name: Ensure mkcert CA exists
+  ansible.builtin.command: mkcert -install
+  args:
+    creates: "{{ mkcert_caroot.stdout }}/rootCA.pem"
+  changed_when: false
+  environment:
+    TRUST_STORES: nss
+
 - name: Apply ClusterIssuer for mkcert CA
   ansible.builtin.command: kubectl apply -f {{ flux_base_path }}/infrastructure/cert-manager/clusterissuer.yaml
   register: ci_apply
@@ -153,33 +144,6 @@
       -n cert-manager --dry-run=client -o yaml | kubectl apply -f -
   register: ca_secret
   changed_when: "'configured' in ca_secret.stdout or 'created' in ca_secret.stdout"
-
-- name: Copy mkcert CA to Lima VM trust store
-  ansible.builtin.shell: |
-    limactl shell {{ lima_vm_name }} sudo bash -c '
-      mkdir -p /usr/local/share/ca-certificates
-      cat > /usr/local/share/ca-certificates/mkcert-ca.crt << EOFCERT
-    {{ lookup("file", mkcert_caroot.stdout + "/rootCA.pem") }}
-    EOFCERT
-      update-ca-certificates
-    '
-  changed_when: false
-  when: ansible_facts['os_family'] == "Darwin"
-
-- name: Copy mkcert CA to Linux trust store
-  when: ansible_facts['os_family'] == "Debian"
-  block:
-    - name: Copy CA certificate
-      ansible.builtin.copy:
-        src: "{{ mkcert_caroot.stdout }}/rootCA.pem"
-        dest: /usr/local/share/ca-certificates/mkcert-ca.crt
-        mode: "0644"
-      become: true
-
-    - name: Update CA certificates
-      ansible.builtin.command: update-ca-certificates
-      become: true
-      changed_when: false
 
 # --- Sealed Secrets ---
 
@@ -255,6 +219,7 @@
     - strimzi
     - registry
     - kyverno
+    - gitea
   register: infra_apply
   changed_when: "'configured' in infra_apply.stdout or 'created' in infra_apply.stdout"
   failed_when: false
@@ -277,42 +242,6 @@
   register: infra_apply2
   changed_when: "'configured' in infra_apply2.stdout or 'created' in infra_apply2.stdout"
 
-# --- Update dnsmasq with Gateway IP on Linux ---
-
-- name: Get Gateway external IP (Linux)
-  when: ansible_facts['os_family'] == "Debian"
-  ansible.builtin.shell: >
-    kubectl get gateway dev-local -o jsonpath='{.status.addresses[0].value}'
-  register: gateway_ip
-  changed_when: false
-  retries: 10
-  delay: 10
-  until: gateway_ip.stdout | length > 0
-
-- name: Update dnsmasq with Gateway IP (Linux)
-  when: ansible_facts['os_family'] == "Debian" and gateway_ip.stdout | length > 0
-  block:
-    - name: Set Gateway IP in dnsmasq config
-      ansible.builtin.lineinfile:
-        path: /etc/dnsmasq.d/dev-local.conf
-        regexp: '^address='
-        line: "address=/dev.local/{{ gateway_ip.stdout }}"
-      become: true
-      register: dnsmasq_updated
-
-    - name: Restart dnsmasq
-      ansible.builtin.systemd:
-        name: dnsmasq
-        state: restarted
-      become: true
-      when: dnsmasq_updated.changed
-
-    - name: Restart systemd-resolved (if active)
-      ansible.builtin.shell: systemctl is-active systemd-resolved && systemctl restart systemd-resolved || true
-      become: true
-      changed_when: false
-      when: dnsmasq_updated.changed
-
 # --- GitOps namespace entries ---
 
 - name: Default namespaces to empty list
@@ -323,7 +252,6 @@
   ansible.builtin.debug:
     msg: >-
       gitops-config.yaml has no entries in 'namespaces:'.
-      No Flux GitRepositories or Kustomizations will be applied.
       Add an entry with: make namespace NAME=<ns> URL=<https-url>
         GITOPS_USER=<user> GITOPS_TOKEN=<pat>
   when: namespaces | length == 0
@@ -383,9 +311,6 @@
       Run:
         make namespace NAME={{ item.0.item.name }} URL={{ item.0.item.url }} \
           GITOPS_USER=<user> GITOPS_TOKEN=<pat>
-
-      The PAT needs repo read + write (write is required by Flux Image
-      Update Automation).
   loop: "{{ gitops_creds_in_cluster.results | zip(gitops_creds_files.results) | list }}"
   loop_control:
     label: "{{ item.0.item.name }}"
@@ -449,7 +374,6 @@
     msg: >-
       No .local/cosign-key.yaml found.
       A fresh cosign keypair will be generated.
-      Existing image signatures from prior clusters will not verify.
       Run 'make cosign-key-export' to persist it for future rebuilds.
 
 - name: Generate cosign key pair if not exists
