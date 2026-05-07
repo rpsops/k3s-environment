@@ -1,4 +1,4 @@
-FROM ubuntu:24.04
+FROM ubuntu:24.04 AS toolbox
 
 ARG TARGETARCH=amd64
 ARG FLUX_VERSION=2.4.0
@@ -52,3 +52,16 @@ RUN curl -fsSL \
     && chmod +x /usr/local/bin/yq
 
 WORKDIR /workspace
+
+# ── git-http-backend (deployed into k3s as a pod) ──────────────────────────
+FROM ubuntu:24.04 AS gitserver
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    apache2 git && \
+    a2enmod cgi alias env && \
+    rm -rf /var/lib/apt/lists/*
+COPY docker/gitserver-apache.conf /etc/apache2/sites-enabled/000-default.conf
+RUN echo "ServerName localhost" >> /etc/apache2/apache2.conf && \
+    mkdir -p /repos && \
+    git config --system http.receivepack true
+EXPOSE 80
+CMD ["apache2ctl", "-D", "FOREGROUND"]

@@ -13,4 +13,3 @@ resources:
   - vector.yaml
   - garage.yaml
   - kyverno.yaml
-  - gitea.yaml

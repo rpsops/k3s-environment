@@ -8,4 +8,3 @@ resources:
   - registry.yaml
   - garage.yaml
   - kyverno.yaml
-  - gitea.yaml

@@ -4,12 +4,14 @@ OS      := $(shell uname -s)
 REPO    := $(CURDIR)
 
 IMAGE         := k3s-toolbox
+GITSERVER_IMAGE := k3s-gitserver:local
 CONTAINER     := k3s-toolbox
 DNS_CONTAINER := k3s-dnsmasq
 DNS_PORT      := 5354
+CFG           := gitops-config.yaml
 
 # All cluster tools run inside the toolbox container
-TOOLBOX  := docker exec $(CONTAINER)
+TOOLBOX  := docker exec -i $(CONTAINER)
 KUBECTL  := $(TOOLBOX) kubectl
 HELM     := $(TOOLBOX) helm
 FLUX     := $(TOOLBOX) flux
@@ -17,9 +19,9 @@ YQ       := $(TOOLBOX) yq
 
 # On macOS k3s runs in a Lima VM; on Linux it runs directly on the host
 ifeq ($(OS), Darwin)
-NERDCTL := limactl shell k3s sudo nerdctl --address /run/k3s/containerd/containerd.sock
+NERDCTL := limactl shell k3s sudo nerdctl --address /run/k3s/containerd/containerd.sock --namespace k8s.io
 else
-NERDCTL := sudo nerdctl --address /run/k3s/containerd/containerd.sock
+NERDCTL := sudo nerdctl --address /run/k3s/containerd/containerd.sock --namespace k8s.io
 endif
 
 .PHONY: build setup install-shims up sync sync-apps reconcile status stop clean help \
@@ -30,7 +32,8 @@ endif
 
 ## Build the k3s-toolbox Docker image
 build:
-	docker build -t $(IMAGE) .
+	docker build -t $(IMAGE) --target toolbox .
+	docker build -t $(GITSERVER_IMAGE) --target gitserver .
 
 ## One-time system setup (requires sudo): configure DNS + install shims
 ## macOS: writes /etc/resolver/dev.local
@@ -74,14 +77,14 @@ endif
 install-shims:
 	@mkdir -p ~/.local/bin
 	@for tool in kubectl helm flux cosign kubeseal yq jq; do \
-		printf '#!/bin/sh\nexec docker exec $(CONTAINER) %s "$$@"\n' $$tool \
+		printf '#!/bin/sh\nexec docker exec -i $(CONTAINER) %s "$$@"\n' $$tool \
 			> ~/.local/bin/$$tool; \
 		chmod +x ~/.local/bin/$$tool; \
 	done
 	@echo "Shims installed to ~/.local/bin/ — add to PATH if not already there"
 
 ## Start k3s and deploy cluster via Flux (no sudo required)
-up:
+up: build
 	@mkdir -p .local .local/mkcert
 ifeq ($(OS), Darwin)
 	@if limactl list 2>/dev/null | grep -q '^k3s.*Running'; then \
@@ -111,6 +114,8 @@ endif
 		-v $(REPO):/workspace \
 		-w /workspace \
 		$(IMAGE) sleep infinity
+	@echo "Loading git server image into k3s containerd..."
+	@docker save $(GITSERVER_IMAGE) | $(NERDCTL) load
 	@docker exec $(CONTAINER) \
 		ansible-playbook -i ansible/inventory/localhost.yml ansible/playbook.yml
 ifeq ($(OS), Darwin)
@@ -168,7 +173,7 @@ sync:
 	$(KUBECTL) apply -k flux/infrastructure/registry/
 	$(KUBECTL) apply -k flux/infrastructure/kyverno/
 	$(KUBECTL) apply -k flux/infrastructure/builds/
-	$(KUBECTL) apply -k flux/infrastructure/gitea/
+	$(KUBECTL) apply -k flux/infrastructure/git-server/
 
 ## Force Flux to re-pull every gitops repo and reconcile every apps-* Kustomization
 sync-apps:
@@ -193,17 +198,12 @@ reconcile:
 	$(FLUX) reconcile helmrelease kyverno -n kyverno
 	$(FLUX) reconcile helmrelease kafbat-ui -n default
 	$(FLUX) reconcile helmrelease valkey -n default
-	$(FLUX) reconcile helmrelease gitea -n gitea
 
-## Add a new gitops namespace entry to gitops-config.yaml + write credentials
-##
-## Usage:
-##   make namespace NAME=<ns> URL=<https-clone-url> \
-##                  GITOPS_USER=<user> GITOPS_TOKEN=<pat> \
-##                  [BRANCH=main] [INTERVAL=1m] [PATH_IN_REPO=./] \
-##                  [IMAGE_AUTOMATION=true]
+## Create namespace + Flux resources (NAME=<ns>)
 namespace:
-	@./scripts/add-namespace.sh
+	@NAME='$(NAME)' BRANCH='$(BRANCH)' INTERVAL='$(INTERVAL)' \
+	 PATH_IN_REPO='$(PATH_IN_REPO)' CONTAINER='$(CONTAINER)' \
+	 ./scripts/setup-namespace.sh
 
 ## Re-write a single namespace's PAT Secret manifest
 ##
@@ -330,7 +330,7 @@ help:
 	@echo "  sync       - Re-apply infrastructure Flux manifests"
 	@echo "  sync-apps  - Force Flux to re-pull every gitops repo"
 	@echo "  reconcile  - Force Flux to reconcile HelmReleases"
-	@echo "  namespace  - Add a gitops namespace entry"
+	@echo "  namespace  - Create namespace + Flux resources (NAME=<ns>)"
 	@echo "  status     - Show Flux sources, kustomizations, and HelmReleases"
 	@echo "  stop       - Stop containers and Lima VM (preserves data)"
 	@echo "  clean      - Destroy everything"
