@@ -52,7 +52,22 @@ After `make up` the cluster is running with no tenant workloads. Tenants registe
 - macOS: `lima` (`brew install lima`)
 - Linux: `sudo` access for `make setup`
 
-All cluster tools (kubectl, helm, flux, cosign, kubeseal, yq) run inside the `k3s-toolbox` container. `make setup` installs shims in `~/.local/bin`.
+## Host footprint
+
+Besides Docker and the Lima VM, `make setup` + `make up` leave four things on the host:
+
+| What | Where | Written by |
+|------|-------|------------|
+| DNS resolver delegation | `/etc/resolver/dev.local` | `make setup` (sudo) |
+| Tool shims (kubectl, helm, flux, cosign, kubeseal, yq, jq) | `~/.local/bin/` | `make setup` |
+| mkcert CA trusted by the OS | macOS Keychain / Linux NSS store | `make up` |
+| Kubeconfig for the toolbox container | `.local/toolbox-kubeconfig` | `make up` |
+
+The shims are one-line shell scripts that delegate to `docker exec k3s-toolbox <tool>` — no cluster tools are installed on the host itself.
+
+The DNS resolver entry points `*.dev.local` at `127.0.0.1:5354`, where a second Docker container (`k3s-dnsmasq`) answers. On macOS, Lima port-forwards 8080/8443 from localhost into the cluster's Cilium gateway.
+
+Both Docker containers (`k3s-toolbox` and `k3s-dnsmasq`) are started by `make up` with no restart policy — they won't come back automatically after a Docker restart or reboot. Re-run `make up` to bring them back (it is idempotent and skips the Lima VM if already running).
 
 ## Make targets
 
@@ -89,6 +104,79 @@ make cosign-key-export           # → .local/cosign-key.yaml
 `.local/` is gitignored. On next `make up`, Ansible restores both automatically if the files exist.
 
 If the cosign key changes, update the public key in `flux/infrastructure/kyverno/verify-internal-images.yaml`.
+
+## Full test sequence
+
+End-to-end walkthrough using `wallet-accessmechanism-gitops` (gitops repo) and `wallet-r2ps` (source repo) as the tenant example.
+
+### 1. Rebuild cluster from scratch
+
+```bash
+# In k3s-environment/
+make clean && make up
+```
+
+`make up` waits until all infrastructure HelmReleases are Ready before returning.
+
+### 2. Register the gitops tenant
+
+```bash
+# In wallet-accessmechanism-gitops/
+make k3s-push       # initialises bare repo on git-server and force-pushes
+make k3s-register   # creates Namespace + GitRepository + Kustomization in Flux,
+                    # then waits for Flux to fetch the repo and apply the kustomization
+```
+
+`make k3s-register` blocks until the kustomization is Applied — all tenant resources
+(Kafka cluster, Valkey, HelmReleases, SealedSecrets, …) exist in the cluster before it returns.
+
+### 3. Build and deploy images
+
+```bash
+# In wallet-r2ps/
+make k3s-deploy   # docker build → docker push :k3s tag
+```
+
+Builds `rust-wallet-bff` and `rust-hsm-worker` and pushes them to the in-cluster Zot registry
+(`registry.dev.local:8443`). Does not restart pods.
+
+### 4. Authorize rollout
+
+```bash
+# In wallet-accessmechanism-gitops/
+make k3s-rollout   # bumps timestamp annotation, commits, tags, pushes → Flux applies → rollout status
+```
+
+Bumps `rollout-authorized-at` on both StatefulSet pod templates, commits, creates a `rollout/...` git tag,
+pushes to the in-cluster git server, triggers Flux reconciliation, and waits for the rollout to complete.
+
+### 5. Smoke test — wallet-bff → Kafka → hsm-worker round-trip
+
+```bash
+curl -X POST https://wallet-bff.dev.local:8443/hsm/v1/device-states \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "publicKey": {
+      "kty": "EC",
+      "crv": "P-256",
+      "x": "yRPnAy1TVytmFdOfJIqqJnFGR-vzlU88bar14facJ_A",
+      "y": "eqacPxdS2jLDQH2fAEKwogwhoB5yxx-Dk6WyQoIfpKQ",
+      "kid": "test-key-1"
+    }
+  }'
+```
+
+Expected: HTTP 200 with a JSON body containing `"status":"OK"`, a `clientId` UUID,
+a `devAuthorizationCode`, and a `serverJwsPublicKey` from hsm-worker.
+### Tear down tenant
+
+```bash
+# In wallet-accessmechanism-gitops/
+make k3s-unregister   # deletes Flux registration, strips Strimzi finalizers, waits for namespace gone
+```
+
+`make k3s-unregister` blocks until the namespace has fully terminated, so
+`make k3s-push && make k3s-register` can be run immediately after without a race.
 
 ## Endpoints
 
