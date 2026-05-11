@@ -87,6 +87,11 @@ provision:
         systemctl enable k3s-port-forward-${PORT}
       done
 
+      # systemd-logind spins at ~100% CPU in this VM (virtual input device
+      # event loop issue); not needed for a headless k3s node.
+      systemctl mask systemd-logind.service
+      systemctl stop systemd-logind.service || true
+
       # Increase inotify limits for in-cluster services
       echo "fs.inotify.max_user_instances=512" > /etc/sysctl.d/99-inotify.conf
       echo "fs.inotify.max_user_watches=524288" >> /etc/sysctl.d/99-inotify.conf
