@@ -8,3 +8,5 @@ resources:
   - registry.yaml
   - garage.yaml
   - kyverno.yaml
+  - openbao.yaml
+  - external-secrets.yaml

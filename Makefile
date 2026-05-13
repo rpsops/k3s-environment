@@ -26,9 +26,9 @@ endif
 
 .PHONY: build setup install-shims up sync sync-apps reconcile status stop clean help \
 	namespace \
-	sealed-secrets-key-export sealed-secrets-key-restore \
 	cosign-key-export cosign-key-restore \
-	gitops-credentials-export gitops-credentials-restore
+	gitops-credentials-export gitops-credentials-restore \
+	openbao-init openbao-unseal openbao-configure openbao-token bao-put bao-get
 
 ## Build the k3s-toolbox Docker image
 build:
@@ -76,11 +76,14 @@ endif
 ## Install kubectl/helm/flux/etc. shims in ~/.local/bin
 install-shims:
 	@mkdir -p ~/.local/bin
-	@for tool in kubectl helm flux cosign kubeseal yq jq; do \
+	@for tool in kubectl helm flux cosign yq jq; do \
 		printf '#!/bin/sh\nexec docker exec -i $(CONTAINER) %s "$$@"\n' $$tool \
 			> ~/.local/bin/$$tool; \
 		chmod +x ~/.local/bin/$$tool; \
 	done
+	@printf '#!/bin/sh\nexec docker exec -i $(CONTAINER) kubectl exec -n openbao openbao-0 -- bao "$$@"\n' \
+		> ~/.local/bin/bao
+	@chmod +x ~/.local/bin/bao
 	@echo "Shims installed to ~/.local/bin/ — add to PATH if not already there"
 
 ## Start k3s and deploy cluster via Flux (no sudo required)
@@ -166,7 +169,8 @@ sync:
 	$(KUBECTL) apply -k flux/infrastructure/namespaces/
 	$(KUBECTL) apply -k flux/infrastructure/cert-manager/
 	$(KUBECTL) apply -k flux/infrastructure/cilium/
-	$(KUBECTL) apply -k flux/infrastructure/sealed-secrets/
+	$(KUBECTL) apply -k flux/infrastructure/openbao/
+	$(KUBECTL) apply -k flux/infrastructure/external-secrets/
 	$(KUBECTL) apply -k flux/infrastructure/garage/
 	$(KUBECTL) apply -k flux/infrastructure/monitoring/
 	$(KUBECTL) apply -k flux/infrastructure/strimzi/
@@ -188,7 +192,8 @@ sync-apps:
 reconcile:
 	$(FLUX) reconcile helmrelease cert-manager -n cert-manager
 	$(FLUX) reconcile helmrelease cilium -n kube-system
-	$(FLUX) reconcile helmrelease sealed-secrets -n kube-system
+	$(FLUX) reconcile helmrelease openbao -n openbao
+	$(FLUX) reconcile helmrelease external-secrets -n external-secrets
 	$(FLUX) reconcile helmrelease garage -n garage
 	$(FLUX) reconcile helmrelease kube-prometheus-stack -n monitoring
 	$(FLUX) reconcile helmrelease loki -n monitoring
@@ -236,36 +241,6 @@ gitops-credentials-restore:
 		exit 1; \
 	fi
 
-## Export the sealed-secrets master key to .local/
-sealed-secrets-key-export:
-	@mkdir -p .local
-	@COUNT=$$($(KUBECTL) get secret -n kube-system \
-		-l sealedsecrets.bitnami.com/sealed-secrets-key=active \
-		-o name 2>/dev/null | wc -l | tr -d ' ') && \
-	if [ "$$COUNT" -eq 0 ]; then \
-		echo "ERROR: no active sealed-secrets key found" >&2; exit 1; \
-	elif [ "$$COUNT" -gt 1 ]; then \
-		echo "ERROR: multiple active sealed-secrets keys ($$COUNT)" >&2; exit 1; \
-	fi
-	@$(KUBECTL) get secret -n kube-system \
-		-l sealedsecrets.bitnami.com/sealed-secrets-key=active \
-		-o yaml | \
-		$(YQ) 'del(.items[].metadata.resourceVersion, .items[].metadata.uid, \
-		           .items[].metadata.creationTimestamp, .items[].metadata.managedFields, \
-		           .items[].metadata.ownerReferences) | .items[0]' \
-		> .local/sealed-secrets-master.key.yaml
-	@chmod 600 .local/sealed-secrets-master.key.yaml
-	@echo "Wrote .local/sealed-secrets-master.key.yaml (mode 600)"
-
-## Restore the sealed-secrets master key from .local/
-sealed-secrets-key-restore:
-	@if [ ! -f .local/sealed-secrets-master.key.yaml ]; then \
-		echo "ERROR: .local/sealed-secrets-master.key.yaml not found" >&2; exit 1; \
-	fi
-	$(KUBECTL) apply -f .local/sealed-secrets-master.key.yaml
-	$(KUBECTL) rollout restart deploy/sealed-secrets -n kube-system
-	$(KUBECTL) rollout status  deploy/sealed-secrets -n kube-system --timeout=120s
-
 ## Export the cosign signing key to .local/
 cosign-key-export:
 	@mkdir -p .local
@@ -286,6 +261,98 @@ cosign-key-restore:
 		echo "ERROR: .local/cosign-key.yaml not found" >&2; exit 1; \
 	fi
 	$(KUBECTL) apply -f .local/cosign-key.yaml
+
+## Initialize OpenBao — saves unseal key + root token to .local/openbao-init.json
+openbao-init:
+	@mkdir -p .local
+	@if [ -f .local/openbao-init.json ]; then \
+		echo "ERROR: .local/openbao-init.json already exists" >&2; exit 1; \
+	fi
+	@$(KUBECTL) exec -n openbao openbao-0 -- \
+		bao operator init -key-shares=1 -key-threshold=1 -format=json \
+		> .local/openbao-init.json
+	@chmod 600 .local/openbao-init.json
+	@echo "Wrote .local/openbao-init.json (mode 600)"
+
+## Unseal OpenBao using key from .local/openbao-init.json
+openbao-unseal:
+	@if [ ! -f .local/openbao-init.json ]; then \
+		echo "ERROR: .local/openbao-init.json not found" >&2; exit 1; \
+	fi
+	@KEY=$$(jq -r '.unseal_keys_b64[0]' .local/openbao-init.json) && \
+	$(KUBECTL) exec -n openbao openbao-0 -- bao operator unseal "$$KEY"
+
+## Configure OpenBao: enable KV v2, enable k8s auth, create eso policy + role
+## Run once after openbao-init + openbao-unseal
+openbao-configure:
+	@if [ ! -f .local/openbao-init.json ]; then \
+		echo "ERROR: .local/openbao-init.json not found — run make openbao-init first" >&2; exit 1; \
+	fi
+	@TOKEN=$$(jq -r '.root_token' .local/openbao-init.json) && \
+	$(KUBECTL) exec -n openbao openbao-0 -- \
+		env VAULT_TOKEN="$$TOKEN" bao secrets enable -path=secret kv-v2 2>/dev/null \
+		|| echo "KV v2 at secret/ already enabled"
+	@TOKEN=$$(jq -r '.root_token' .local/openbao-init.json) && \
+	$(KUBECTL) exec -n openbao openbao-0 -- \
+		env VAULT_TOKEN="$$TOKEN" bao auth enable kubernetes 2>/dev/null \
+		|| echo "kubernetes auth already enabled"
+	@TOKEN=$$(jq -r '.root_token' .local/openbao-init.json) && \
+	K8S_HOST="https://kubernetes.default.svc.cluster.local" && \
+	SA_JWT=$$($(KUBECTL) exec -n openbao openbao-0 -- \
+		cat /var/run/secrets/kubernetes.io/serviceaccount/token) && \
+	CA_CERT=$$($(KUBECTL) exec -n openbao openbao-0 -- \
+		cat /var/run/secrets/kubernetes.io/serviceaccount/ca.crt) && \
+	$(KUBECTL) exec -n openbao openbao-0 -- \
+		env VAULT_TOKEN="$$TOKEN" \
+		bao write auth/kubernetes/config \
+			kubernetes_host="$$K8S_HOST" \
+			kubernetes_ca_cert="$$CA_CERT" \
+			token_reviewer_jwt="$$SA_JWT"
+	@TOKEN=$$(jq -r '.root_token' .local/openbao-init.json) && \
+	printf 'path "secret/data/*" { capabilities = ["read"] }\npath "secret/metadata/*" { capabilities = ["read", "list"] }\n' | \
+	$(KUBECTL) exec -n openbao openbao-0 -i -- \
+		env VAULT_TOKEN="$$TOKEN" bao policy write eso -
+	@TOKEN=$$(jq -r '.root_token' .local/openbao-init.json) && \
+	ESO_NS="external-secrets" && \
+	$(KUBECTL) exec -n openbao openbao-0 -- \
+		env VAULT_TOKEN="$$TOKEN" \
+		bao write auth/kubernetes/role/eso \
+			bound_service_account_names="external-secrets" \
+			bound_service_account_namespaces="$$ESO_NS" \
+			policies="eso" \
+			ttl=1h
+	@echo "OpenBao configured: KV v2, k8s auth, eso policy + role"
+
+## Print the OpenBao root token
+openbao-token:
+	@jq -r '.root_token' .local/openbao-init.json 2>/dev/null \
+		|| { echo "ERROR: .local/openbao-init.json not found" >&2; exit 1; }
+
+## Put a secret into OpenBao KV v2
+## Usage: make bao-put SECRET=<path> KEY=<key> VALUE=<value>
+##   e.g. make bao-put SECRET=myapp KEY=api-key VALUE=secret123
+bao-put:
+	@if [ -z "$(SECRET)" ] || [ -z "$(KEY)" ] || [ -z "$(VALUE)" ]; then \
+		echo "ERROR: set SECRET, KEY, and VALUE" >&2; \
+		echo "  e.g. make bao-put SECRET=myapp KEY=api-key VALUE=secret123" >&2; \
+		exit 1; \
+	fi
+	@TOKEN=$$(jq -r '.root_token' .local/openbao-init.json) && \
+	$(KUBECTL) exec -n openbao openbao-0 -- \
+		env VAULT_TOKEN="$$TOKEN" bao kv put secret/$(SECRET) $(KEY)='$(VALUE)'
+
+## Get a secret from OpenBao KV v2
+## Usage: make bao-get SECRET=<path>
+##   e.g. make bao-get SECRET=myapp
+bao-get:
+	@if [ -z "$(SECRET)" ]; then \
+		echo "ERROR: set SECRET" >&2; \
+		echo "  e.g. make bao-get SECRET=myapp" >&2; \
+		exit 1; \
+	fi
+	@TOKEN=$$(jq -r '.root_token' .local/openbao-init.json) && \
+	$(KUBECTL) exec -n openbao openbao-0 -- \
+		env VAULT_TOKEN="$$TOKEN" bao kv get secret/$(SECRET)
 
 ## Show Flux status
 status:
@@ -320,6 +387,8 @@ else
 		sudo /usr/local/bin/k3s-uninstall.sh; \
 	fi
 endif
+	@rm -f .local/openbao-init.json
+	@echo "Removed .local/openbao-init.json (new cluster needs fresh init)"
 
 ## Display available targets
 help:

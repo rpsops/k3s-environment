@@ -141,68 +141,172 @@
   register: ca_secret
   changed_when: "'configured' in ca_secret.stdout or 'created' in ca_secret.stdout"
 
-# --- Sealed Secrets ---
+# --- OpenBao ---
 
-- name: Check for saved sealed-secrets master key
-  ansible.builtin.stat:
-    path: "{{ playbook_dir }}/../.local/sealed-secrets-master.key.yaml"
-  register: ss_key_file
+- name: Apply OpenBao HelmRelease
+  ansible.builtin.command: "kubectl apply -k {{ flux_base_path }}/infrastructure/openbao"
+  register: openbao_apply
+  changed_when: "'configured' in openbao_apply.stdout or 'created' in openbao_apply.stdout"
 
-- name: Check if active sealed-secrets key already exists in cluster
+- name: Wait for OpenBao pod to be running (sealed pods are Running but not Ready)
   ansible.builtin.shell: |
-    kubectl get secret -n kube-system \
-      -l sealedsecrets.bitnami.com/sealed-secrets-key=active \
-      -o name 2>/dev/null | wc -l | tr -d ' '
-  register: ss_key_in_cluster
+    kubectl get pod openbao-0 -n openbao -o jsonpath='{.status.phase}' 2>/dev/null
+  register: openbao_phase
   changed_when: false
+  retries: 18
+  delay: 10
+  until: openbao_phase.stdout == "Running"
 
-- name: Restore sealed-secrets master key from .local/ (only if absent in cluster)
-  when:
-    - ss_key_file.stat.exists
-    - ss_key_in_cluster.stdout | int == 0
-  ansible.builtin.command: >
-    kubectl apply -f {{ playbook_dir }}/../.local/sealed-secrets-master.key.yaml
-  register: ss_key_restore
-  changed_when: "'configured' in ss_key_restore.stdout or 'created' in ss_key_restore.stdout"
-
-- name: Notice when no saved sealed-secrets key is available
-  when: not ss_key_file.stat.exists
-  ansible.builtin.debug:
-    msg: >-
-      No .local/sealed-secrets-master.key.yaml found.
-      The controller will generate a fresh key on first start.
-      Run 'make sealed-secrets-key-export' to persist it for future rebuilds.
-
-- name: Apply sealed-secrets
-  ansible.builtin.command: "kubectl apply -k {{ flux_base_path }}/infrastructure/sealed-secrets"
-  register: ss_apply
-  changed_when: "'configured' in ss_apply.stdout or 'created' in ss_apply.stdout"
-
-- name: Wait for sealed-secrets controller to be ready
-  ansible.builtin.command: flux get helmrelease sealed-secrets -n kube-system
-  changed_when: false
-  retries: 20
-  delay: 15
-  register: ss_ready
-  until: "'True' in ss_ready.stdout"
-
-# --- Seal secrets ---
-
-- name: Check if Grafana admin secret exists
-  ansible.builtin.command: kubectl get secret grafana-admin -n monitoring
-  register: grafana_admin_secret
+- name: Check OpenBao status
+  ansible.builtin.shell: |
+    kubectl exec -n openbao openbao-0 -- sh -c 'bao status -format=json 2>/dev/null; true' 2>/dev/null || echo '{}'
+  register: openbao_status_raw
   changed_when: false
   failed_when: false
 
-- name: Generate and seal Grafana admin secret
-  when: grafana_admin_secret.rc != 0
+- name: Parse OpenBao status
+  ansible.builtin.set_fact:
+    openbao_initialized: "{{ (openbao_status_raw.stdout | from_json).initialized | default(false) }}"
+    openbao_sealed: "{{ (openbao_status_raw.stdout | from_json).sealed | default(true) }}"
+
+- name: Initialize OpenBao (first time only)
+  when: not openbao_initialized
+  block:
+    - name: Run operator init
+      ansible.builtin.shell: |
+        kubectl exec -n openbao openbao-0 -- \
+          bao operator init -key-shares=1 -key-threshold=1 -format=json
+      register: openbao_init_result
+
+    - name: Save init output to .local/
+      ansible.builtin.copy:
+        content: "{{ openbao_init_result.stdout }}"
+        dest: "{{ playbook_dir }}/../.local/openbao-init.json"
+        mode: '0600'
+
+    - name: Set init data fact
+      ansible.builtin.set_fact:
+        openbao_init_data: "{{ openbao_init_result.stdout | from_json }}"
+
+- name: Load saved init data for unseal
+  ansible.builtin.set_fact:
+    openbao_init_data: "{{ lookup('file', playbook_dir + '/../.local/openbao-init.json') | from_json }}"
+  when: openbao_sealed and openbao_init_data | default(none) is none
+
+- name: Unseal OpenBao
+  when: openbao_sealed
+  ansible.builtin.shell: |
+    kubectl exec -n openbao openbao-0 -- \
+      bao operator unseal {{ openbao_init_data.unseal_keys_b64[0] }}
+  changed_when: true
+
+- name: Configure OpenBao (first time only)
+  when: not openbao_initialized
+  block:
+    - name: Enable KV v2 secret engine
+      ansible.builtin.shell: |
+        kubectl exec -n openbao openbao-0 -- \
+          env VAULT_TOKEN={{ openbao_init_data.root_token }} \
+          bao secrets enable -path=secret kv-v2
+      changed_when: true
+
+    - name: Enable Kubernetes auth method
+      ansible.builtin.shell: |
+        kubectl exec -n openbao openbao-0 -- \
+          env VAULT_TOKEN={{ openbao_init_data.root_token }} \
+          bao auth enable kubernetes
+      changed_when: true
+
+    - name: Configure Kubernetes auth to use in-cluster API
+      ansible.builtin.shell: |
+        kubectl exec -n openbao openbao-0 -- \
+          env VAULT_TOKEN={{ openbao_init_data.root_token }} \
+          bao write auth/kubernetes/config \
+            kubernetes_host="https://kubernetes.default.svc.cluster.local:443"
+      changed_when: true
+
+    - name: Write ESO read policy
+      ansible.builtin.shell: |
+        kubectl exec -i -n openbao openbao-0 -- \
+          env VAULT_TOKEN={{ openbao_init_data.root_token }} \
+          bao policy write eso-read - <<'POLICY'
+        path "secret/data/*"     { capabilities = ["read"] }
+        path "secret/metadata/*" { capabilities = ["read", "list"] }
+        POLICY
+      changed_when: true
+
+    - name: Create Kubernetes auth role for ESO service account
+      ansible.builtin.shell: |
+        kubectl exec -n openbao openbao-0 -- \
+          env VAULT_TOKEN={{ openbao_init_data.root_token }} \
+          bao write auth/kubernetes/role/eso \
+            bound_service_account_names=external-secrets \
+            bound_service_account_namespaces=external-secrets \
+            policies=eso-read \
+            ttl=1h
+      changed_when: true
+
+# --- External Secrets Operator ---
+
+- name: Apply ESO HelmRelease only (CRDs not ready yet)
+  ansible.builtin.command: >
+    kubectl apply -f {{ flux_base_path }}/infrastructure/external-secrets/helmrelease.yaml
+  register: eso_apply
+  changed_when: "'configured' in eso_apply.stdout or 'created' in eso_apply.stdout"
+
+- name: Wait for ESO HelmRelease to be ready
+  ansible.builtin.command: flux get helmrelease external-secrets -n external-secrets
+  changed_when: false
+  retries: 20
+  delay: 15
+  register: eso_ready
+  until: "'True' in eso_ready.stdout"
+
+- name: Wait for ClusterSecretStore CRD to be registered
+  ansible.builtin.command: kubectl get crd clustersecretstores.external-secrets.io
+  changed_when: false
+  retries: 12
+  delay: 5
+  register: crd_ready
+  until: crd_ready.rc == 0
+
+- name: Apply full ESO kustomization (CRDs now available)
+  ansible.builtin.command: "kubectl apply -k {{ flux_base_path }}/infrastructure/external-secrets"
+  register: eso_full_apply
+  changed_when: "'configured' in eso_full_apply.stdout or 'created' in eso_full_apply.stdout"
+
+# --- Write secrets to OpenBao ---
+
+- name: Check for OpenBao init file
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/../.local/openbao-init.json"
+  register: openbao_init_file
+
+- name: Fail if OpenBao init file is missing
+  ansible.builtin.fail:
+    msg: "No .local/openbao-init.json — run 'make up' to let OpenBao initialise, or 'make openbao-init' manually"
+  when: not openbao_init_file.stat.exists
+
+- name: Load OpenBao init data
+  ansible.builtin.set_fact:
+    openbao_init_data: "{{ lookup('file', playbook_dir + '/../.local/openbao-init.json') | from_json }}"
+
+- name: Check if Grafana credentials exist in OpenBao
+  ansible.builtin.shell: |
+    kubectl exec -n openbao openbao-0 -- \
+      env VAULT_TOKEN={{ openbao_init_data.root_token }} \
+      bao kv get -format=json secret/grafana 2>/dev/null
+  register: grafana_in_bao
+  changed_when: false
+  failed_when: false
+
+- name: Write Grafana credentials to OpenBao
+  when: grafana_in_bao.rc != 0
   ansible.builtin.shell: |
     PASSWORD=$(openssl rand -base64 16)
-    kubectl create secret generic grafana-admin \
-      --from-literal=username=admin \
-      --from-literal=password="$PASSWORD" \
-      -n monitoring --dry-run=client -o yaml | \
-    kubeseal --controller-name=sealed-secrets --controller-namespace=kube-system --format yaml | kubectl apply -f -
+    kubectl exec -n openbao openbao-0 -- \
+      env VAULT_TOKEN={{ openbao_init_data.root_token }} \
+      bao kv put secret/grafana admin=admin "password=$PASSWORD"
   changed_when: true
 
 # --- Deploy remaining infrastructure ---

@@ -8,3 +8,4 @@ resources:
   - kafka-servicemonitor.yaml
   - grafana-dashboards.yaml
   - grafana-route.yaml
+  - grafana-admin-external-secret.yaml

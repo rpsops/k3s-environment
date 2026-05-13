@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssl \
     python3 \
     python3-pip \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --break-system-packages ansible
@@ -30,11 +31,13 @@ RUN curl -fsSL \
     "https://github.com/fluxcd/flux2/releases/download/v${FLUX_VERSION}/flux_${FLUX_VERSION}_linux_${TARGETARCH}.tar.gz" \
     | tar -xz -C /usr/local/bin flux
 
-RUN KUBESEAL_VER=$(curl -fsSL https://api.github.com/repos/bitnami-labs/sealed-secrets/releases/latest \
+RUN BAO_VER=$(curl -fsSL https://api.github.com/repos/openbao/openbao/releases/latest \
         | jq -r '.tag_name | ltrimstr("v")') \
+    && BAO_ARCH=$([ "${TARGETARCH}" = "amd64" ] && echo "x86_64" || echo "${TARGETARCH}") \
     && curl -fsSL \
-        "https://github.com/bitnami-labs/sealed-secrets/releases/download/v${KUBESEAL_VER}/kubeseal-${KUBESEAL_VER}-linux-${TARGETARCH}.tar.gz" \
-    | tar -xz -C /usr/local/bin kubeseal
+        "https://github.com/openbao/openbao/releases/download/v${BAO_VER}/bao_${BAO_VER}_Linux_${BAO_ARCH}.tar.gz" \
+    | tar -xz -C /usr/local/bin bao \
+    && chmod +x /usr/local/bin/bao
 
 RUN curl -fsSL \
     "https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-${TARGETARCH}" \
