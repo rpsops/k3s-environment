@@ -81,7 +81,7 @@ install-shims:
 			> ~/.local/bin/$$tool; \
 		chmod +x ~/.local/bin/$$tool; \
 	done
-	@printf '#!/bin/sh\nexec docker exec -i $(CONTAINER) kubectl exec -n openbao openbao-0 -- bao "$$@"\n' \
+	@printf '#!/bin/sh\nTOKEN=$$(docker exec $(CONTAINER) jq -r .root_token /workspace/.local/openbao-init.json 2>/dev/null)\nexec docker exec -i $(CONTAINER) kubectl exec -n openbao openbao-0 -- env VAULT_TOKEN="$$TOKEN" bao "$$@"\n' \
 		> ~/.local/bin/bao
 	@chmod +x ~/.local/bin/bao
 	@echo "Shims installed to ~/.local/bin/ — add to PATH if not already there"
