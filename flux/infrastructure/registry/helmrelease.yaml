@@ -18,30 +18,23 @@ spec:
       create: true
       storage: 20Gi
 
-    # Enable search and UI extensions
-    mountConfig:
-      enabled: true
-      config: |
+    service:
+      nodePort: 30500
+
+    mountConfig: true
+
+    configFiles:
+      config.json: |-
         {
-          "storage": {
-            "rootDirectory": "/var/lib/registry"
-          },
+          "storage": { "rootDirectory": "/var/lib/registry" },
           "http": {
             "address": "0.0.0.0",
-            "port": "5000"
+            "port": "5000",
+            "compat": ["docker2s2"]
           },
-          "log": {
-            "level": "info"
-          },
+          "log": { "level": "info" },
           "extensions": {
-            "search": {
-              "enable": true
-            },
-            "ui": {
-              "enable": true
-            },
-            "lint": {
-              "enable": true
-            }
+            "search": { "enable": true },
+            "ui":     { "enable": true }
           }
         }

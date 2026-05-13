@@ -62,6 +62,12 @@ spec:
           cpu: 1
           memory: 1Gi
 
+    # Disable memcached caches (not needed in SingleBinary; each takes 500m CPU)
+    chunksCache:
+      enabled: false
+    resultsCache:
+      enabled: false
+
     # Disable all distributed components
     read:
       replicas: 0

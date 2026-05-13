@@ -1,38 +1,11 @@
 ---
-# Day-to-day startup — no sudo required.
-# On macOS: starts Lima VM
-# On Linux: verifies k3s is running (installed by make setup)
-# Then deploys everything via Flux.
-# Run with: make up
-- name: Start k3s and deploy via Flux
+# Runs inside the k3s-toolbox container (docker exec k3s-toolbox ansible-playbook ...)
+# k3s startup, DNS setup, and CA trust are handled by the Makefile.
+- name: Deploy cluster infrastructure via Flux
   hosts: localhost
   connection: local
   gather_facts: true
   become: false
-
-  tasks:
-    - name: Start k3s (macOS - Lima VM)
-      when: ansible_facts['os_family'] == "Darwin"
-      ansible.builtin.include_role:
-        name: k3s
-        tasks_from: darwin
-
-    - name: Verify k3s is running (Linux)
-      when: ansible_facts['os_family'] == "Debian"
-      block:
-        - name: Check k3s API server
-          ansible.builtin.command: kubectl get nodes
-          changed_when: false
-          retries: 6
-          delay: 5
-          register: k3s_check
-          until: k3s_check.rc == 0
-
-    - name: Create .kube directory
-      ansible.builtin.file:
-        path: "{{ ansible_facts['env']['HOME'] }}/.kube"
-        state: directory
-        mode: "0755"
 
   roles:
     - flux

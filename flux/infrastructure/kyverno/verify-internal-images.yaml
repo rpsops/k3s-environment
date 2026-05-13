@@ -13,6 +13,11 @@ spec:
           - resources:
               kinds:
                 - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - wallet-hsm
       imageExtractors:
         Pod:
           - name: "containers"
