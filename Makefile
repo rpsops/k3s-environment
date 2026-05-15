@@ -12,7 +12,6 @@ CFG           := gitops-config.yaml
 
 # All cluster tools run inside the toolbox container
 TOOLBOX  := docker exec -i $(CONTAINER)
-KUBECTL  := $(TOOLBOX) kubectl
 HELM     := $(TOOLBOX) helm
 FLUX     := $(TOOLBOX) flux
 YQ       := $(TOOLBOX) yq
@@ -20,11 +19,14 @@ YQ       := $(TOOLBOX) yq
 # On macOS k3s runs in a Lima VM; on Linux it runs directly on the host
 ifeq ($(OS), Darwin)
 NERDCTL := limactl shell k3s sudo nerdctl --address /run/k3s/containerd/containerd.sock --namespace k8s.io
+KUBECTL  := $(TOOLBOX) kubectl
 else
 NERDCTL := sudo nerdctl --address /run/k3s/containerd/containerd.sock --namespace k8s.io
+KUBECTL  := kubectl
 endif
 
-.PHONY: build setup install-shims up sync sync-apps reconcile status stop clean help \
+.PHONY: build setup setup-macos setup-linux install-shims up up-macos up-linux \
+	sync sync-apps reconcile status stop clean help \
 	namespace \
 	sealed-secrets-key-export sealed-secrets-key-restore \
 	cosign-key-export cosign-key-restore \
@@ -40,22 +42,36 @@ build:
 ## Linux: installs k3s + dnsmasq, configures systemd-resolved
 setup: build
 ifeq ($(OS), Darwin)
+	@$(MAKE) setup-macos
+else
+	@$(MAKE) setup-linux
+endif
+	@$(MAKE) install-shims
+
+## macOS setup: install lima if missing + configure /etc/resolver/dev.local
+setup-macos:
 	@command -v limactl >/dev/null 2>&1 || brew install lima
 	@echo "sudo required: creating /etc/resolver/dev.local to delegate *.dev.local DNS to the k3s-dnsmasq container"
 	@sudo mkdir -p /etc/resolver
 	@printf 'nameserver 127.0.0.1\nport $(DNS_PORT)\n' | sudo tee /etc/resolver/dev.local > /dev/null
 	@echo "DNS configured: *.dev.local → 127.0.0.1:$(DNS_PORT)"
-else
-	@echo "sudo required: installing k3s, dnsmasq, and configuring systemd-resolved"
+
+## Linux setup: install k3s + configure registries + systemd-resolved
+setup-linux:
+	@echo "sudo required: installing k3s and configuring systemd-resolved"
+	@sudo mkdir -p /etc/rancher/k3s
+	@printf 'mirrors:\n  "zot.registry.svc.cluster.local:5000":\n    endpoint:\n      - "http://localhost:30500"\n' \
+		| sudo tee /etc/rancher/k3s/registries.yaml > /dev/null
+	@echo "Registry mirror: zot.registry.svc.cluster.local:5000 → http://localhost:30500"
 	@if [ ! -f /usr/local/bin/k3s ]; then \
 		echo "Installing k3s..."; \
 		curl -sfL https://get.k3s.io | \
-		INSTALL_K3S_EXEC="--disable=traefik --disable=servicelb \
+		sudo env INSTALL_K3S_EXEC="--disable=traefik --disable=servicelb \
 		  --flannel-backend=none --disable-network-policy \
 		  --disable-kube-proxy --write-kubeconfig-mode 644 \
 		  --tls-san host.docker.internal \
 		  --resolv-conf /run/systemd/resolve/resolv.conf" \
-		sudo sh -; \
+		sh -; \
 		mkdir -p ~/.kube; \
 		sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config; \
 		sudo chown "$$(id -u):$$(id -g)" ~/.kube/config; \
@@ -63,20 +79,22 @@ else
 		echo "fs.inotify.max_user_instances=512"   | sudo tee    /etc/sysctl.d/99-inotify.conf > /dev/null; \
 		echo "fs.inotify.max_user_watches=524288"  | sudo tee -a /etc/sysctl.d/99-inotify.conf > /dev/null; \
 		sudo sysctl --system; \
+	else \
+		echo "Restarting k3s to reload registries.yaml..."; \
+		sudo systemctl restart k3s; \
 	fi
-	@sudo apt-get install -y --no-install-recommends dnsmasq
 	@sudo mkdir -p /etc/systemd/resolved.conf.d
-	@printf '[Resolve]\nDNS=127.0.0.1:5353\nDomains=~dev.local\n' \
+	@printf '[Resolve]\nDNS=127.0.0.1:%s\nDomains=~dev.local\n' "$(DNS_PORT)" \
 		| sudo tee /etc/systemd/resolved.conf.d/dev-local.conf > /dev/null
 	@sudo systemctl restart systemd-resolved
-	@echo "DNS configured: *.dev.local → 127.0.0.1:5353 via systemd-resolved"
-endif
-	@$(MAKE) install-shims
+	@echo "DNS configured: *.dev.local → 127.0.0.1:$(DNS_PORT) via systemd-resolved"
 
-## Install kubectl/helm/flux/etc. shims in ~/.local/bin
+## Install helm/flux/etc. shims in ~/.local/bin (kubectl excluded on Linux — bundled with k3s)
 install-shims:
 	@mkdir -p ~/.local/bin
-	@for tool in kubectl helm flux cosign kubeseal yq jq; do \
+	@tools="helm flux cosign kubeseal yq jq"; \
+	if [ "$$(uname -s)" = "Darwin" ]; then tools="kubectl $$tools"; fi; \
+	for tool in $$tools; do \
 		printf '#!/bin/sh\nexec docker exec -i $(CONTAINER) %s "$$@"\n' $$tool \
 			> ~/.local/bin/$$tool; \
 		chmod +x ~/.local/bin/$$tool; \
@@ -87,6 +105,13 @@ install-shims:
 up: build
 	@mkdir -p .local .local/mkcert
 ifeq ($(OS), Darwin)
+	@$(MAKE) up-macos
+else
+	@$(MAKE) up-linux
+endif
+
+## macOS: start Lima VM, write kubeconfig, run toolbox+ansible, configure DNS+CA
+up-macos:
 	@if limactl list 2>/dev/null | grep -q '^k3s.*Running'; then \
 		echo "Lima k3s VM already running"; \
 	elif limactl list 2>/dev/null | grep -q '^k3s'; then \
@@ -98,14 +123,6 @@ ifeq ($(OS), Darwin)
 		| sed 's|https://127.0.0.1:6443|https://host.docker.internal:6443|g' \
 		> .local/toolbox-kubeconfig
 	@chmod 600 .local/toolbox-kubeconfig
-else
-	@kubectl get nodes > /dev/null 2>&1 \
-		|| { echo "ERROR: k3s is not running. Run: make setup"; exit 1; }
-	@sed 's|https://127\.0\.0\.1:6443|https://host.docker.internal:6443|g; \
-	      s|https://localhost:6443|https://host.docker.internal:6443|g' \
-		~/.kube/config > .local/toolbox-kubeconfig
-	@chmod 600 .local/toolbox-kubeconfig
-endif
 	@docker rm -f $(CONTAINER) 2>/dev/null || true
 	@docker run -d --name $(CONTAINER) \
 		--add-host=host.docker.internal:host-gateway \
@@ -118,13 +135,55 @@ endif
 	@docker save $(GITSERVER_IMAGE) | $(NERDCTL) load
 	@docker exec $(CONTAINER) \
 		ansible-playbook -i ansible/inventory/localhost.yml ansible/playbook.yml
-ifeq ($(OS), Darwin)
-	@# macOS: Lima port-forwards 8080/8443 to the Cilium gateway; resolve to localhost
+	@# Lima port-forwards 8080/8443 to the Cilium gateway; resolve to localhost
 	@printf 'port=$(DNS_PORT)\nno-resolv\naddress=/dev.local/127.0.0.1\n' \
 		> .local/dnsmasq.conf
 	@echo "DNS: *.dev.local → 127.0.0.1 (Lima forwards 8080/8443 to Cilium gateway)"
-else
-	@# Linux: k3s is on the host; ClusterIP is directly routable
+	@docker rm -f $(DNS_CONTAINER) 2>/dev/null || true
+	@docker run -d --name $(DNS_CONTAINER) \
+		-p 127.0.0.1:$(DNS_PORT):$(DNS_PORT)/udp \
+		-v $(REPO)/.local/dnsmasq.conf:/workspace/.local/dnsmasq.conf:ro \
+		$(IMAGE) \
+		dnsmasq --no-daemon --conf-file=/workspace/.local/dnsmasq.conf
+	@if [ -f .local/mkcert/rootCA.pem ]; then \
+		security add-trusted-cert -r trustRoot \
+			-k ~/Library/Keychains/login.keychain \
+			.local/mkcert/rootCA.pem \
+		&& echo "CA trusted in macOS Keychain" \
+		|| echo "CA already trusted (or failed — check Keychain manually)"; \
+	fi
+
+## Linux: start k3s, write kubeconfig, run toolbox+ansible, configure DNS+CA
+up-linux:
+	@if ! command -v k3s >/dev/null 2>&1; then \
+		echo "ERROR: k3s not installed. Run: make setup"; exit 1; \
+	fi
+	@if ! systemctl is-active k3s > /dev/null 2>&1; then \
+		echo "Starting k3s..."; \
+		sudo systemctl start k3s; \
+		echo "Waiting for k3s API..."; \
+		until k3s kubectl get nodes >/dev/null 2>&1; do sleep 2; done; \
+	fi
+	@cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+	@chmod 600 ~/.kube/config
+	@sed \
+		-e 's|https://127\.0\.0\.1:6443|https://host.docker.internal:6443|g' \
+		-e 's|https://localhost:6443|https://host.docker.internal:6443|g' \
+		~/.kube/config > .local/toolbox-kubeconfig
+	@chmod 600 .local/toolbox-kubeconfig
+	@docker rm -f $(CONTAINER) 2>/dev/null || true
+	@docker run -d --name $(CONTAINER) \
+		--add-host=host.docker.internal:host-gateway \
+		-v $(REPO)/.local/toolbox-kubeconfig:/root/.kube/config:ro \
+		-v $(REPO)/.local/mkcert:/root/.local/share/mkcert \
+		-v $(REPO):/workspace \
+		-w /workspace \
+		$(IMAGE) sleep infinity
+	@echo "Loading git server image into k3s containerd..."
+	@docker save $(GITSERVER_IMAGE) | $(NERDCTL) load
+	@docker exec $(CONTAINER) \
+		ansible-playbook -i ansible/inventory/localhost.yml ansible/playbook.yml
+	@# k3s is on the host; ClusterIP is directly routable
 	@GATEWAY_IP=$$($(KUBECTL) get svc cilium-gateway-dev-local -n default \
 		-o jsonpath='{.spec.clusterIP}' 2>/dev/null); \
 	if [ -z "$$GATEWAY_IP" ] || [ "$$GATEWAY_IP" = "None" ]; then \
@@ -134,22 +193,12 @@ else
 			> .local/dnsmasq.conf; \
 		echo "DNS: *.dev.local → $$GATEWAY_IP (Cilium gateway ClusterIP)"; \
 	fi
-endif
 	@docker rm -f $(DNS_CONTAINER) 2>/dev/null || true
 	@docker run -d --name $(DNS_CONTAINER) \
 		-p 127.0.0.1:$(DNS_PORT):$(DNS_PORT)/udp \
 		-v $(REPO)/.local/dnsmasq.conf:/workspace/.local/dnsmasq.conf:ro \
 		$(IMAGE) \
 		dnsmasq --no-daemon --conf-file=/workspace/.local/dnsmasq.conf
-ifeq ($(OS), Darwin)
-	@if [ -f .local/mkcert/rootCA.pem ]; then \
-		security add-trusted-cert -r trustRoot \
-			-k ~/Library/Keychains/login.keychain \
-			.local/mkcert/rootCA.pem \
-		&& echo "CA trusted in macOS Keychain" \
-		|| echo "CA already trusted (or failed — check Keychain manually)"; \
-	fi
-else
 	@if [ -f .local/mkcert/rootCA.pem ]; then \
 		mkdir -p ~/.pki/nssdb; \
 		certutil -d sql:$$HOME/.pki/nssdb -N --empty-password 2>/dev/null || true; \
@@ -157,8 +206,13 @@ else
 			-i .local/mkcert/rootCA.pem 2>/dev/null \
 		&& echo "CA trusted in NSS store (~/.pki/nssdb)" \
 		|| echo "CA already trusted"; \
+		sudo mkdir -p "/etc/docker/certs.d/registry.dev.local:8443"; \
+		sudo cp .local/mkcert/rootCA.pem "/etc/docker/certs.d/registry.dev.local:8443/ca.crt"; \
+		echo "CA trusted for Docker at /etc/docker/certs.d/registry.dev.local:8443/ca.crt"; \
+		sudo cp .local/mkcert/rootCA.pem /usr/local/share/ca-certificates/k3s-env-ca.crt; \
+		sudo update-ca-certificates; \
+		echo "CA trusted system-wide (curl, wget, etc.)"; \
 	fi
-endif
 
 ## Re-apply infrastructure Flux manifests after editing flux/ files
 sync:
@@ -250,9 +304,7 @@ sealed-secrets-key-export:
 	@$(KUBECTL) get secret -n kube-system \
 		-l sealedsecrets.bitnami.com/sealed-secrets-key=active \
 		-o yaml | \
-		$(YQ) 'del(.items[].metadata.resourceVersion, .items[].metadata.uid, \
-		           .items[].metadata.creationTimestamp, .items[].metadata.managedFields, \
-		           .items[].metadata.ownerReferences) | .items[0]' \
+		$(YQ) 'del(.items[].metadata.resourceVersion, .items[].metadata.uid, .items[].metadata.creationTimestamp, .items[].metadata.managedFields, .items[].metadata.ownerReferences) | .items[0]' \
 		> .local/sealed-secrets-master.key.yaml
 	@chmod 600 .local/sealed-secrets-master.key.yaml
 	@echo "Wrote .local/sealed-secrets-master.key.yaml (mode 600)"
@@ -273,9 +325,7 @@ cosign-key-export:
 		echo "ERROR: Secret/cosign-key not found in flux-system" >&2; exit 1; \
 	fi
 	@$(KUBECTL) get secret cosign-key -n flux-system -o yaml | \
-		$(YQ) 'del(.metadata.resourceVersion, .metadata.uid, \
-		           .metadata.creationTimestamp, .metadata.managedFields, \
-		           .metadata.ownerReferences)' \
+		$(YQ) 'del(.metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.managedFields, .metadata.ownerReferences)' \
 		> .local/cosign-key.yaml
 	@chmod 600 .local/cosign-key.yaml
 	@echo "Wrote .local/cosign-key.yaml (mode 600)"
@@ -305,9 +355,13 @@ ifeq ($(OS), Darwin)
 	@if limactl list 2>/dev/null | grep -q '^k3s.*Running'; then \
 		limactl stop k3s; \
 	fi
+else
+	@if [ -f /usr/local/bin/k3s-killall.sh ]; then \
+		sudo k3s-killall.sh; \
+	fi
 endif
 
-## Destroy k3s and all containers completely
+## Destroy cluster state and containers (Linux: stops k3s but keeps it installed)
 clean:
 	@docker rm -f $(CONTAINER) $(DNS_CONTAINER) 2>/dev/null || true
 ifeq ($(OS), Darwin)
@@ -316,9 +370,19 @@ ifeq ($(OS), Darwin)
 	fi
 	@rm -f ~/.kube/config
 else
-	@if [ -f /usr/local/bin/k3s-uninstall.sh ]; then \
-		sudo /usr/local/bin/k3s-uninstall.sh; \
-	fi
+	@if [ -f /usr/local/bin/k3s-killall.sh ]; then sudo k3s-killall.sh; fi
+	@sudo ip link delete cilium_host 2>/dev/null || true
+	@sudo ip link delete cilium_vxlan 2>/dev/null || true
+	@sudo rm -rf /var/lib/rancher/k3s/
+	@for tbl in nat filter mangle raw; do \
+		for chain in $$(sudo iptables -t $$tbl -L -n 2>/dev/null | awk '/^Chain (CILIUM|OLD_CILIUM)/{print $$2}'); do \
+			sudo iptables -t $$tbl -F $$chain 2>/dev/null || true; \
+		done; \
+		for chain in $$(sudo iptables -t $$tbl -L -n 2>/dev/null | awk '/^Chain (CILIUM|OLD_CILIUM)/{print $$2}'); do \
+			sudo iptables -t $$tbl -D $$tbl $$chain 2>/dev/null || true; \
+			sudo iptables -t $$tbl -X $$chain 2>/dev/null || true; \
+		done; \
+	done
 endif
 
 ## Display available targets
@@ -333,7 +397,7 @@ help:
 	@echo "  namespace  - Create namespace + Flux resources (NAME=<ns>)"
 	@echo "  status     - Show Flux sources, kustomizations, and HelmReleases"
 	@echo "  stop       - Stop containers and Lima VM (preserves data)"
-	@echo "  clean      - Destroy everything"
+	@echo "  clean      - Destroy cluster state (Linux: k3s binary kept; make up restarts it)"
 	@echo ""
 	@echo "Container: $(CONTAINER)  Image: $(IMAGE)"
 	@echo "NERDCTL:   $(NERDCTL)"

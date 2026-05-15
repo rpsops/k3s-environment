@@ -182,11 +182,11 @@ make k3s-unregister   # deletes Flux registration, strips Strimzi finalizers, wa
 
 | Service | URL |
 |---------|-----|
-| Grafana | https://grafana.dev.local |
-| Hubble | https://hubble.dev.local |
-| KafBat | https://kafbat.dev.local |
-| Headlamp | https://headlamp.dev.local |
-| Zot registry | https://registry.dev.local |
+| Grafana | https://grafana.dev.local:8443 |
+| Hubble | https://hubble.dev.local:8443 |
+| KafBat | https://kafbat.dev.local:8443 |
+| Headlamp | https://headlamp.dev.local:8443 |
+| Zot registry | https://registry.dev.local:8443 |
 | Git server | http://git.dev.local:8080 |
 
 All `*.dev.local` resolved via dnsmasq. TLS via mkcert local CA (trusted by `make setup`).
