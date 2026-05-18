@@ -30,28 +30,40 @@ portForwards:
     hostPort: 6443
     hostIP: "0.0.0.0"
     proto: tcp
-  # HTTP ingress: forward only the IPv4-wildcard binding (socat uses bind=0.0.0.0);
-  # ignore IPv6/loopback variants to prevent Lima from racing on the host port.
+  # HTTP/HTTPS ingress: socat inside the VM listens on 18080/18443 and forwards
+  # to the Cilium Gateway NodePort. Offset ports prevent Lima from racing
+  # Cilium Envoy (which briefly binds 0.0.0.0:8080/8443 during listener setup).
+  # Explicit per-IP ignore rules are required; guestPortRange catch-all does not
+  # match 0.0.0.0 events, so Lima would auto-forward Envoy's ports and steal
+  # Mac:8080/8443 before socat's 18080/18443 rules get a chance.
   - guestIP: "0.0.0.0"
     guestPort: 8080
+    ignore: true
+  - guestIP: "::"
+    guestPort: 8080
+    ignore: true
+  - guestIP: "127.0.0.1"
+    guestPort: 8080
+    ignore: true
+  - guestIP: "0.0.0.0"
+    guestPort: 8443
+    ignore: true
+  - guestIP: "::"
+    guestPort: 8443
+    ignore: true
+  - guestIP: "127.0.0.1"
+    guestPort: 8443
+    ignore: true
+  - guestIP: "0.0.0.0"
+    guestPort: 18080
     hostPort: 8080
     proto: tcp
-  - guestIP: "::"
-    guestPort: 8080
-    ignore: true
-  - guestIP: "127.0.0.1"
-    guestPort: 8080
-    ignore: true
-  # HTTPS ingress — same pattern
   - guestIP: "0.0.0.0"
-    guestPort: 8443
+    guestPort: 18443
     hostPort: 8443
     proto: tcp
-  - guestIP: "::"
-    guestPort: 8443
-    ignore: true
-  - guestIP: "127.0.0.1"
-    guestPort: 8443
+  # Belt-and-suspenders: suppress all other auto-forwards.
+  - guestPortRange: [1, 65535]
     ignore: true
 
 # Provisioning scripts to install and configure k3s
@@ -62,29 +74,27 @@ provision:
       #!/bin/bash
       set -eux -o pipefail
       
-      # Install socat for gateway port forwarding
+      # socat bridges Lima's port-forwards (18080/18443) to the Cilium Gateway
+      # NodePorts. The script polls k3s until the service has a NodePort, then
+      # hands off to socat. Using offset guest ports (18080/18443) avoids any
+      # conflict if a future Cilium version binds 0.0.0.0:8080/8443 directly.
       apt-get install -y --no-install-recommends socat
 
-      # Systemd services that bridge Lima's port-forwarded ports to the
-      # Cilium Gateway IP. The script polls k3s until the Gateway has an
-      # IP, then hands off to socat.
       base64 -d > /usr/local/bin/k3s-port-forward.sh << 'EOF'
-      IyEvYmluL2Jhc2gKUE9SVD0kMQp3aGlsZSB0cnVlOyBkbwogIEdXPSQoa3ViZWN0bCAtLWt1YmVj
-      b25maWc9L2V0Yy9yYW5jaGVyL2szcy9rM3MueWFtbCBcCiAgICBnZXQgc3ZjIGNpbGl1bS1nYXRl
-      d2F5LWRldi1sb2NhbCAtbiBkZWZhdWx0IFwKICAgIC1vIGpzb25wYXRoPSd7LnNwZWMuY2x1c3Rl
-      cklQfScgMj4vZGV2L251bGwgfHwgdHJ1ZSkKICBbIC1uICIkR1ciIF0gJiYgWyAiJEdXIiAhPSAi
-      Tm9uZSIgXSAmJiBcCiAgICBleGVjIHNvY2F0ICJUQ1AtTElTVEVOOiR7UE9SVH0sZm9yayxiaW5k
-      PTAuMC4wLjAscmV1c2VhZGRyIiAiVENQOiR7R1d9OiR7UE9SVH0iCiAgc2xlZXAgNQpkb25lCg==
+      IyEvYmluL2Jhc2gKR1VFU1Q9JDEKU1ZDX1BPUlQ9JDIKd2hpbGUgdHJ1ZTsgZG8KICBOUD0kKGt1YmVjdGwgLS1rdWJlY29uZmlnPS9ldGMvcmFuY2hlci9rM3MvazNzLnlhbWwgXAogICAgZ2V0IHN2YyBjaWxpdW0tZ2F0ZXdheS1kZXYtbG9jYWwgLW4gZGVmYXVsdCBcCiAgICAtbyAianNvbnBhdGg9ey5zcGVjLnBvcnRzWz8oQC5wb3J0PT0ke1NWQ19QT1JUfSldLm5vZGVQb3J0fSIgMj4vZGV2L251bGwgfHwgdHJ1ZSkKICBbIC1uICIkTlAiIF0gJiYgWyAiJE5QIiAhPSAiMCIgXSAmJiBcCiAgICBleGVjIHNvY2F0ICJUQ1AtTElTVEVOOiR7R1VFU1R9LGZvcmssYmluZD0wLjAuMC4wLHJldXNlYWRkciIgIlRDUDoxMjcuMC4wLjE6JHtOUH0iCiAgc2xlZXAgNQpkb25lCg==
       EOF
       chmod +x /usr/local/bin/k3s-port-forward.sh
 
-      for PORT in 8080 8443; do
-        printf '[Unit]\nDescription=Forward port %s to Cilium Gateway\nAfter=k3s.service\nWants=k3s.service\n\n[Service]\nExecStart=/usr/local/bin/k3s-port-forward.sh %s\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n' \
-          "$PORT" "$PORT" > /etc/systemd/system/k3s-port-forward-${PORT}.service
+      for PAIR in "18080:8080" "18443:8443"; do
+        GUEST="${PAIR%%:*}"
+        SVC_PORT="${PAIR##*:}"
+        printf '[Unit]\nDescription=Forward guest:%s to Cilium Gateway NodePort for svc:%s\nAfter=k3s.service\nWants=k3s.service\n\n[Service]\nExecStart=/usr/local/bin/k3s-port-forward.sh %s %s\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n' \
+          "$GUEST" "$SVC_PORT" "$GUEST" "$SVC_PORT" \
+          > /etc/systemd/system/k3s-port-forward-${GUEST}.service
       done
       systemctl daemon-reload
-      for PORT in 8080 8443; do
-        systemctl enable k3s-port-forward-${PORT}
+      for GUEST in 18080 18443; do
+        systemctl enable k3s-port-forward-${GUEST}
       done
 
       # systemd-logind spins at ~100% CPU in this VM (virtual input device
@@ -127,9 +137,9 @@ provision:
         sleep 2
       done
       
-      # Start port-forward services now that k3s is running
-      for PORT in 8080 8443; do
-        systemctl start k3s-port-forward-${PORT}
+      # Start port-forward services (will block until gateway NodePort appears)
+      for GUEST in 18080 18443; do
+        systemctl start k3s-port-forward-${GUEST} || true
       done
 
       # Ensure containerd socket is accessible

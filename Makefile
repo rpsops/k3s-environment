@@ -121,6 +121,16 @@ endif
 	@docker save $(GITSERVER_IMAGE) | $(NERDCTL) load
 	@docker exec $(CONTAINER) \
 		ansible-playbook -i ansible/inventory/localhost.yml ansible/playbook.yml
+	@echo "Waiting for all HelmReleases to be Ready (up to 20m)..."
+	@$(KUBECTL) wait helmrelease --all -A --for=condition=Ready --timeout=20m \
+		|| { \
+		echo "WARNING: some HelmReleases not Ready:"; \
+		$(KUBECTL) get helmrelease -A --no-headers \
+			| awk '$$4 != "True" {print "  " $$0}'; \
+		}
+	@echo "Waiting for Cilium gateway to be programmed..."
+	@$(KUBECTL) wait gateway dev-local -n default \
+		--for=condition=Programmed --timeout=5m
 ifeq ($(OS), Darwin)
 	@# macOS: Lima port-forwards 8080/8443 to the Cilium gateway; resolve to localhost
 	@printf 'port=$(DNS_PORT)\nno-resolv\naddress=/dev.local/127.0.0.1\n' \
@@ -130,13 +140,9 @@ else
 	@# Linux: k3s is on the host; ClusterIP is directly routable
 	@GATEWAY_IP=$$($(KUBECTL) get svc cilium-gateway-dev-local -n default \
 		-o jsonpath='{.spec.clusterIP}' 2>/dev/null); \
-	if [ -z "$$GATEWAY_IP" ] || [ "$$GATEWAY_IP" = "None" ]; then \
-		echo "WARNING: could not get Cilium gateway ClusterIP; DNS not configured"; \
-	else \
-		printf 'port=$(DNS_PORT)\nno-resolv\naddress=/dev.local/%s\n' "$$GATEWAY_IP" \
-			> .local/dnsmasq.conf; \
-		echo "DNS: *.dev.local → $$GATEWAY_IP (Cilium gateway ClusterIP)"; \
-	fi
+	printf 'port=$(DNS_PORT)\nno-resolv\naddress=/dev.local/%s\n' "$$GATEWAY_IP" \
+		> .local/dnsmasq.conf; \
+	echo "DNS: *.dev.local → $$GATEWAY_IP (Cilium gateway ClusterIP)"
 endif
 	@docker rm -f $(DNS_CONTAINER) 2>/dev/null || true
 	@docker run -d --name $(DNS_CONTAINER) \
@@ -152,6 +158,17 @@ ifeq ($(OS), Darwin)
 		&& echo "CA trusted in macOS Keychain" \
 		|| echo "CA already trusted (or failed — check Keychain manually)"; \
 	fi
+	@echo "Waiting for HTTP ingress (Mac:8080 → socat → Cilium gateway)..."
+	@i=0; while [ $$i -lt 60 ]; do \
+		code=$$(curl -s --max-time 3 http://127.0.0.1:8080/ \
+			-o /dev/null -w '%{http_code}' 2>/dev/null); \
+		[ "$$code" != "000" ] && echo "Ingress OK (HTTP $$code)" && break; \
+		i=$$((i+1)); echo "  ($$i/60) waiting..."; sleep 5; \
+	done; \
+	code=$$(curl -s --max-time 3 http://127.0.0.1:8080/ \
+		-o /dev/null -w '%{http_code}' 2>/dev/null); \
+	[ "$$code" != "000" ] \
+		|| { echo "ERROR: HTTP ingress not responding after 5m"; exit 1; }
 else
 	@if [ -f .local/mkcert/rootCA.pem ]; then \
 		mkdir -p ~/.pki/nssdb; \
