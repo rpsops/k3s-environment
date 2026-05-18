@@ -1,0 +1,324 @@
+---
+# --- Cilium CNI must be installed before anything else can schedule ---
+
+- name: Install Gateway API CRDs
+  ansible.builtin.command: >
+    kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
+  register: gwapi_apply
+  changed_when: "'configured' in gwapi_apply.stdout or 'created' in gwapi_apply.stdout"
+
+- name: Check if Cilium is installed
+  ansible.builtin.command: helm status cilium -n kube-system
+  register: cilium_check
+  changed_when: false
+  failed_when: false
+
+- name: Install Cilium via Helm (CNI bootstrap - before ArgoCD)
+  when: cilium_check.rc != 0
+  block:
+    - name: Add Cilium Helm repo
+      ansible.builtin.command: helm repo add cilium https://helm.cilium.io/
+      changed_when: false
+
+    - name: Install Cilium
+      ansible.builtin.command: >
+        helm install cilium cilium/cilium
+        --namespace kube-system
+        --set operator.replicas=1
+        --set ipam.mode=kubernetes
+        --set kubeProxyReplacement=true
+        --set k8sServiceHost=localhost
+        --set k8sServicePort=6443
+        --set gatewayAPI.enabled=true
+        --set l2announcements.enabled=true
+        --set externalIPs.enabled=true
+        --set hubble.enabled=true
+        --set hubble.relay.enabled=true
+        --set hubble.ui.enabled=true
+        --set hubble.metrics.enabled="{dns,drop,tcp,flow,icmp,http}"
+        --set hubble.metrics.serviceMonitor.enabled=false
+      changed_when: true
+
+- name: Wait for nodes to be Ready (Cilium CNI active)
+  ansible.builtin.command: >
+    kubectl wait --for=condition=Ready nodes --all --timeout=120s
+  changed_when: false
+  retries: 6
+  delay: 15
+  register: nodes_ready
+  until: nodes_ready.rc == 0
+
+# --- ArgoCD ---
+
+- name: Add ArgoCD Helm repo
+  ansible.builtin.command: helm repo add argo https://argoproj.github.io/argo-helm
+  changed_when: false
+
+- name: Update Helm repos
+  ansible.builtin.command: helm repo update
+  changed_when: false
+
+- name: Install ArgoCD
+  ansible.builtin.shell: |
+    helm upgrade --install argocd argo/argo-cd \
+      --namespace argocd --create-namespace \
+      --set 'configs.params.server\.insecure=true' \
+      --wait --timeout 5m
+  register: argocd_install
+  changed_when: "'STATUS: deployed' in argocd_install.stdout or 'has been upgraded' in argocd_install.stdout or argocd_install.changed"
+
+- name: Ensure argocd-cm exists (required by argocd CLI --core mode)
+  ansible.builtin.shell: |
+    kubectl get cm argocd-cm -n argocd >/dev/null 2>&1 || \
+    kubectl create configmap argocd-cm -n argocd
+  changed_when: false
+
+# --- Infrastructure: namespaces ---
+
+- name: Apply namespaces
+  ansible.builtin.command: kubectl apply -k {{ argocd_base_path }}/infrastructure/namespaces
+  register: ns_apply
+  changed_when: "'configured' in ns_apply.stdout or 'created' in ns_apply.stdout"
+
+- name: Verify DNS works inside cluster
+  ansible.builtin.shell: |
+    kubectl run dns-verify --rm -i --restart=Never --image=busybox --timeout=30s -- \
+      nslookup charts.jetstack.io 2>&1 | tail -3
+  register: dns_verify
+  changed_when: false
+  failed_when: false
+
+- name: Fix CoreDNS if DNS is broken
+  when: "dns_verify.rc is defined and dns_verify.rc != 0"
+  ansible.builtin.shell: |
+    kubectl rollout restart daemonset cilium -n kube-system
+    kubectl rollout restart deployment coredns -n kube-system
+    sleep 20
+
+# --- cert-manager ---
+
+- name: Apply cert-manager Application
+  ansible.builtin.command: kubectl apply -f {{ argocd_base_path }}/applications/cert-manager.yaml
+  register: cm_apply
+  changed_when: "'configured' in cm_apply.stdout or 'created' in cm_apply.stdout"
+
+- name: Wait for cert-manager to be ready
+  ansible.builtin.command: >
+    kubectl wait deploy/cert-manager-webhook -n cert-manager
+    --for=condition=available --timeout=300s
+  changed_when: false
+  retries: 10
+  delay: 20
+  register: cm_ready
+  until: cm_ready.rc == 0
+
+- name: Get mkcert CA root path
+  ansible.builtin.command: mkcert -CAROOT
+  register: mkcert_caroot
+  changed_when: false
+
+- name: Ensure mkcert CA exists
+  ansible.builtin.command: mkcert -install
+  args:
+    creates: "{{ mkcert_caroot.stdout }}/rootCA.pem"
+  changed_when: false
+  environment:
+    TRUST_STORES: nss
+
+- name: Apply ClusterIssuer for mkcert CA
+  ansible.builtin.command: kubectl apply -f {{ argocd_base_path }}/infrastructure/cert-manager/clusterissuer.yaml
+  register: ci_apply
+  changed_when: "'configured' in ci_apply.stdout or 'created' in ci_apply.stdout"
+
+- name: Create mkcert CA secret in cert-manager namespace
+  ansible.builtin.shell: |
+    kubectl create secret tls mkcert-ca \
+      --cert="{{ mkcert_caroot.stdout }}/rootCA.pem" \
+      --key="{{ mkcert_caroot.stdout }}/rootCA-key.pem" \
+      -n cert-manager --dry-run=client -o yaml | kubectl apply -f -
+  register: ca_secret
+  changed_when: "'configured' in ca_secret.stdout or 'created' in ca_secret.stdout"
+
+# --- Sealed Secrets ---
+
+- name: Check for saved sealed-secrets master key
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/../.local/sealed-secrets-master.key.yaml"
+  register: ss_key_file
+
+- name: Check if active sealed-secrets key already exists in cluster
+  ansible.builtin.shell: |
+    kubectl get secret -n kube-system \
+      -l sealedsecrets.bitnami.com/sealed-secrets-key=active \
+      -o name 2>/dev/null | wc -l | tr -d ' '
+  register: ss_key_in_cluster
+  changed_when: false
+
+- name: Restore sealed-secrets master key from .local/ (only if absent in cluster)
+  when:
+    - ss_key_file.stat.exists
+    - ss_key_in_cluster.stdout | int == 0
+  ansible.builtin.command: >
+    kubectl apply -f {{ playbook_dir }}/../.local/sealed-secrets-master.key.yaml
+  register: ss_key_restore
+  changed_when: "'configured' in ss_key_restore.stdout or 'created' in ss_key_restore.stdout"
+
+- name: Notice when no saved sealed-secrets key is available
+  when: not ss_key_file.stat.exists
+  ansible.builtin.debug:
+    msg: >-
+      No .local/sealed-secrets-master.key.yaml found.
+      The controller will generate a fresh key on first start.
+      Run 'make sealed-secrets-key-export' to persist it for future rebuilds.
+
+- name: Apply sealed-secrets Application
+  ansible.builtin.command: kubectl apply -f {{ argocd_base_path }}/applications/sealed-secrets.yaml
+  register: ss_apply
+  changed_when: "'configured' in ss_apply.stdout or 'created' in ss_apply.stdout"
+
+- name: Wait for sealed-secrets controller to be ready
+  ansible.builtin.command: >
+    kubectl wait deploy/sealed-secrets -n kube-system
+    --for=condition=available --timeout=300s
+  changed_when: false
+  retries: 15
+  delay: 15
+  register: ss_ready
+  until: ss_ready.rc == 0
+
+# --- Seal secrets ---
+
+- name: Check if Grafana admin secret exists
+  ansible.builtin.command: kubectl get secret grafana-admin -n monitoring
+  register: grafana_admin_secret
+  changed_when: false
+  failed_when: false
+
+- name: Generate and seal Grafana admin secret
+  when: grafana_admin_secret.rc != 0
+  ansible.builtin.shell: |
+    PASSWORD=$(openssl rand -base64 16)
+    kubectl create secret generic grafana-admin \
+      --from-literal=username=admin \
+      --from-literal=password="$PASSWORD" \
+      -n monitoring --dry-run=client -o yaml | \
+    kubeseal --controller-name=sealed-secrets --controller-namespace=kube-system --format yaml | kubectl apply -f -
+  changed_when: true
+
+# --- Deploy remaining infrastructure ---
+
+- name: Apply infrastructure Applications (first pass)
+  ansible.builtin.command: kubectl apply -f {{ argocd_base_path }}/applications/{{ item }}
+  loop:
+    - garage.yaml
+    - kube-prometheus-stack.yaml
+    - loki.yaml
+    - vector.yaml
+    - strimzi.yaml
+    - registry.yaml
+    - kyverno.yaml
+  register: infra_apply
+  changed_when: "'configured' in infra_apply.stdout or 'created' in infra_apply.stdout"
+  failed_when: false
+
+- name: Wait for infra Applications to be healthy
+  ansible.builtin.command: >
+    argocd --core --namespace argocd app wait {{ item }} --health --sync --timeout 600
+  loop:
+    - garage
+    - registry
+    - kyverno
+    - strimzi
+  register: infra_wait
+  changed_when: false
+  retries: 3
+  delay: 10
+  until: infra_wait.rc == 0
+  failed_when: false
+
+- name: Apply infrastructure (second pass - CRDs now available)
+  ansible.builtin.command: kubectl apply -f {{ argocd_base_path }}/applications/{{ item }}
+  loop:
+    - cilium.yaml
+    - kube-prometheus-stack.yaml
+  register: infra_apply2
+  changed_when: "'configured' in infra_apply2.stdout or 'created' in infra_apply2.stdout"
+
+- name: Apply Cilium plain manifests (gateway, certificate, routes)
+  ansible.builtin.shell: |
+    kubectl apply -f {{ argocd_base_path }}/infrastructure/cilium/
+    kubectl apply -f {{ argocd_base_path }}/infrastructure/registry/ingress.yaml
+    kubectl apply -f {{ argocd_base_path }}/infrastructure/monitoring/
+    kubectl apply -f {{ argocd_base_path }}/infrastructure/kyverno/
+    kubectl apply -f {{ argocd_base_path }}/infrastructure/argocd-route.yaml
+  register: plain_apply
+  changed_when: "'configured' in plain_apply.stdout or 'created' in plain_apply.stdout"
+
+- name: Apply git-server manifests
+  ansible.builtin.shell: kubectl apply -f {{ argocd_base_path }}/infrastructure/git-server/
+  register: gitserver_apply
+  changed_when: "'configured' in gitserver_apply.stdout or 'created' in gitserver_apply.stdout"
+
+# --- Image Updater ---
+
+- name: Apply Image Updater Application
+  ansible.builtin.command: kubectl apply -f {{ argocd_base_path }}/applications/image-updater.yaml
+  register: iu_apply
+  changed_when: "'configured' in iu_apply.stdout or 'created' in iu_apply.stdout"
+  failed_when: false
+
+# --- Cosign ---
+
+- name: Check for saved cosign signing key
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/../.local/cosign-key.yaml"
+  register: cosign_key_file
+
+- name: Check if cosign-key Secret already exists in cluster
+  ansible.builtin.command: kubectl get secret cosign-key -n argocd
+  register: cosign_key_in_cluster
+  changed_when: false
+  failed_when: false
+
+- name: Restore cosign signing key from .local/ (only if absent in cluster)
+  when:
+    - cosign_key_file.stat.exists
+    - cosign_key_in_cluster.rc != 0
+  ansible.builtin.shell: |
+    sed 's/^\( *namespace:\) .*/\1 argocd/' {{ playbook_dir }}/../.local/cosign-key.yaml \
+      | kubectl apply -f -
+  register: cosign_key_restore
+  changed_when: "'configured' in cosign_key_restore.stdout or 'created' in cosign_key_restore.stdout"
+
+- name: Notice when no saved cosign key is available
+  when:
+    - not cosign_key_file.stat.exists
+    - cosign_key_in_cluster.rc != 0
+  ansible.builtin.debug:
+    msg: >-
+      No .local/cosign-key.yaml found.
+      A fresh cosign keypair will be generated.
+      Run 'make cosign-key-export' to persist it for future rebuilds.
+
+- name: Generate cosign key pair if not exists
+  ansible.builtin.shell: |
+    if ! kubectl get secret cosign-key -n argocd >/dev/null 2>&1; then
+      COSIGN_PASSWORD="" cosign generate-key-pair k8s://argocd/cosign-key
+      echo "created"
+    else
+      echo "exists"
+    fi
+  register: cosign_key
+  changed_when: "'created' in cosign_key.stdout"
+
+# --- Status ---
+
+- name: Show status
+  ansible.builtin.shell: argocd --core --namespace argocd app list
+  register: final_status
+  changed_when: false
+  failed_when: false
+
+- name: Display status
+  ansible.builtin.debug:
+    var: final_status.stdout_lines

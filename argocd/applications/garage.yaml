@@ -1,0 +1,52 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: garage
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://deimosfr.github.io/deimosfr-charts/
+    chart: garage
+    targetRevision: "*"
+    helm:
+      values: |
+        image:
+          repository: dxflrs/garage
+          tag: v2.2.0
+        garage:
+          replicationFactor: "1"
+          consistencyMode: "consistent"
+          dbEngine: "lmdb"
+          compressionLevel: "1"
+          s3:
+            api:
+              region: "garage"
+              rootDomain: ".s3.garage.local"
+            web:
+              rootDomain: ".web.garage.local"
+              index: "index.html"
+        persistence:
+          enabled: true
+          meta:
+            size: 500Mi
+          data:
+            size: 20Gi
+        replicaCount: 1
+        initContainers: []
+        monitoring:
+          metrics:
+            enabled: true
+            serviceMonitor:
+              enabled: true
+              labels:
+                release: kube-prometheus-stack
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: garage
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

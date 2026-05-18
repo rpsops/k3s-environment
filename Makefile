@@ -13,7 +13,7 @@ CFG           := gitops-config.yaml
 # All cluster tools run inside the toolbox container
 TOOLBOX  := docker exec -i $(CONTAINER)
 HELM     := $(TOOLBOX) helm
-FLUX     := $(TOOLBOX) flux
+ARGOCD   := $(TOOLBOX) argocd --core --namespace argocd
 YQ       := $(TOOLBOX) yq
 
 # On macOS k3s runs in a Lima VM; on Linux it runs directly on the host
@@ -27,7 +27,6 @@ endif
 
 .PHONY: build setup setup-macos setup-linux install-shims up up-macos up-linux \
 	sync sync-apps reconcile status stop clean help \
-	namespace \
 	sealed-secrets-key-export sealed-secrets-key-restore \
 	cosign-key-export cosign-key-restore \
 	gitops-credentials-export gitops-credentials-restore
@@ -89,19 +88,22 @@ setup-linux:
 	@sudo systemctl restart systemd-resolved
 	@echo "DNS configured: *.dev.local → 127.0.0.1:$(DNS_PORT) via systemd-resolved"
 
-## Install helm/flux/etc. shims in ~/.local/bin (kubectl excluded on Linux — bundled with k3s)
+## Install helm/argocd/etc. shims in ~/.local/bin (kubectl excluded on Linux — bundled with k3s)
 install-shims:
 	@mkdir -p ~/.local/bin
-	@tools="helm flux cosign kubeseal yq jq"; \
+	@tools="helm cosign kubeseal yq jq"; \
 	if [ "$$(uname -s)" = "Darwin" ]; then tools="kubectl $$tools"; fi; \
 	for tool in $$tools; do \
 		printf '#!/bin/sh\nexec docker exec -i $(CONTAINER) %s "$$@"\n' $$tool \
 			> ~/.local/bin/$$tool; \
 		chmod +x ~/.local/bin/$$tool; \
 	done
+	@printf '#!/bin/sh\nexec docker exec -i $(CONTAINER) argocd --core --namespace argocd "$$@"\n' \
+		> ~/.local/bin/argocd
+	@chmod +x ~/.local/bin/argocd
 	@echo "Shims installed to ~/.local/bin/ — add to PATH if not already there"
 
-## Start k3s and deploy cluster via Flux (no sudo required)
+## Start k3s and deploy cluster via ArgoCD (no sudo required)
 up: build
 	@mkdir -p .local .local/mkcert
 ifeq ($(OS), Darwin)
@@ -214,50 +216,28 @@ up-linux:
 		echo "CA trusted system-wide (curl, wget, etc.)"; \
 	fi
 
-## Re-apply infrastructure Flux manifests after editing flux/ files
+## Re-apply ArgoCD Applications and plain infra manifests after editing argocd/ files
 sync:
-	$(KUBECTL) apply -k flux/infrastructure/sources/
-	$(KUBECTL) apply -k flux/infrastructure/namespaces/
-	$(KUBECTL) apply -k flux/infrastructure/cert-manager/
-	$(KUBECTL) apply -k flux/infrastructure/cilium/
-	$(KUBECTL) apply -k flux/infrastructure/sealed-secrets/
-	$(KUBECTL) apply -k flux/infrastructure/garage/
-	$(KUBECTL) apply -k flux/infrastructure/monitoring/
-	$(KUBECTL) apply -k flux/infrastructure/strimzi/
-	$(KUBECTL) apply -k flux/infrastructure/registry/
-	$(KUBECTL) apply -k flux/infrastructure/kyverno/
-	$(KUBECTL) apply -k flux/infrastructure/builds/
-	$(KUBECTL) apply -k flux/infrastructure/git-server/
+	$(KUBECTL) apply -k argocd/infrastructure/namespaces/
+	$(KUBECTL) apply -f argocd/applications/
+	$(KUBECTL) apply -f argocd/infrastructure/cert-manager/clusterissuer.yaml
+	$(KUBECTL) apply -f argocd/infrastructure/cilium/
+	$(KUBECTL) apply -f argocd/infrastructure/kyverno/
+	$(KUBECTL) apply -f argocd/infrastructure/monitoring/
+	$(KUBECTL) apply -f argocd/infrastructure/registry/ingress.yaml
+	$(KUBECTL) apply -f argocd/infrastructure/git-server/
+	$(KUBECTL) apply -f argocd/infrastructure/argocd-route.yaml
+	$(ARGOCD) app sync --all
 
-## Force Flux to re-pull every gitops repo and reconcile every apps-* Kustomization
+## Force ArgoCD to re-sync every apps-* Application registered by tenants
 sync-apps:
-	@for s in $$($(FLUX) get sources git --no-header 2>/dev/null | awk '{print $$1}'); do \
-		$(FLUX) reconcile source git $$s; \
-	done
-	@for k in $$($(FLUX) get kustomizations --no-header 2>/dev/null | awk '/^apps-/ {print $$1}'); do \
-		$(FLUX) reconcile kustomization $$k; \
+	@for app in $$($(ARGOCD) app list -o name 2>/dev/null | grep '^apps-'); do \
+		$(ARGOCD) app sync $$app; \
 	done
 
-## Force Flux to reconcile HelmReleases immediately
+## Force ArgoCD to re-sync all infra Applications immediately
 reconcile:
-	$(FLUX) reconcile helmrelease cert-manager -n cert-manager
-	$(FLUX) reconcile helmrelease cilium -n kube-system
-	$(FLUX) reconcile helmrelease sealed-secrets -n kube-system
-	$(FLUX) reconcile helmrelease garage -n garage
-	$(FLUX) reconcile helmrelease kube-prometheus-stack -n monitoring
-	$(FLUX) reconcile helmrelease loki -n monitoring
-	$(FLUX) reconcile helmrelease vector -n monitoring
-	$(FLUX) reconcile helmrelease strimzi-kafka-operator -n kafka
-	$(FLUX) reconcile helmrelease zot -n registry
-	$(FLUX) reconcile helmrelease kyverno -n kyverno
-	$(FLUX) reconcile helmrelease kafbat-ui -n default
-	$(FLUX) reconcile helmrelease valkey -n default
-
-## Create namespace + Flux resources (NAME=<ns>)
-namespace:
-	@NAME='$(NAME)' BRANCH='$(BRANCH)' INTERVAL='$(INTERVAL)' \
-	 PATH_IN_REPO='$(PATH_IN_REPO)' CONTAINER='$(CONTAINER)' \
-	 ./scripts/setup-namespace.sh
+	$(ARGOCD) app sync --all
 
 ## Re-write a single namespace's PAT Secret manifest
 ##
@@ -270,7 +250,7 @@ gitops-credentials-export:
 	fi
 	@mkdir -p .local
 	@$(KUBECTL) create secret generic gitops-credentials-$(NAME) \
-		-n flux-system \
+		-n argocd \
 		--from-literal=username='$(GITOPS_USER)' \
 		--from-literal=password='$(GITOPS_TOKEN)' \
 		--dry-run=client -o yaml > .local/gitops-credentials-$(NAME).yaml
@@ -321,10 +301,10 @@ sealed-secrets-key-restore:
 ## Export the cosign signing key to .local/
 cosign-key-export:
 	@mkdir -p .local
-	@if ! $(KUBECTL) get secret cosign-key -n flux-system >/dev/null 2>&1; then \
-		echo "ERROR: Secret/cosign-key not found in flux-system" >&2; exit 1; \
+	@if ! $(KUBECTL) get secret cosign-key -n argocd >/dev/null 2>&1; then \
+		echo "ERROR: Secret/cosign-key not found in argocd" >&2; exit 1; \
 	fi
-	@$(KUBECTL) get secret cosign-key -n flux-system -o yaml | \
+	@$(KUBECTL) get secret cosign-key -n argocd -o yaml | \
 		$(YQ) 'del(.metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.managedFields, .metadata.ownerReferences)' \
 		> .local/cosign-key.yaml
 	@chmod 600 .local/cosign-key.yaml
@@ -337,16 +317,9 @@ cosign-key-restore:
 	fi
 	$(KUBECTL) apply -f .local/cosign-key.yaml
 
-## Show Flux status
+## Show ArgoCD status
 status:
-	@echo "=== Git Sources ==="
-	@$(FLUX) get sources git
-	@echo ""
-	@echo "=== Kustomizations ==="
-	@$(FLUX) get kustomizations
-	@echo ""
-	@echo "=== HelmReleases ==="
-	@$(FLUX) get helmreleases -A
+	@$(ARGOCD) app list
 
 ## Stop k3s and toolbox containers (preserves data)
 stop:
@@ -390,12 +363,11 @@ help:
 	@echo "Available targets:"
 	@echo "  build      - Build the k3s-toolbox Docker image"
 	@echo "  setup      - One-time setup (sudo): DNS + k3s (Linux) + shims"
-	@echo "  up         - Start k3s and deploy cluster via Flux (no sudo)"
-	@echo "  sync       - Re-apply infrastructure Flux manifests"
-	@echo "  sync-apps  - Force Flux to re-pull every gitops repo"
-	@echo "  reconcile  - Force Flux to reconcile HelmReleases"
-	@echo "  namespace  - Create namespace + Flux resources (NAME=<ns>)"
-	@echo "  status     - Show Flux sources, kustomizations, and HelmReleases"
+	@echo "  up         - Start k3s and deploy cluster via ArgoCD (no sudo)"
+	@echo "  sync       - Re-apply ArgoCD Applications and namespaces"
+	@echo "  sync-apps  - Force ArgoCD to re-sync tenant apps-* Applications"
+	@echo "  reconcile  - Force ArgoCD to re-sync all Applications"
+	@echo "  status     - Show ArgoCD Application status"
 	@echo "  stop       - Stop containers and Lima VM (preserves data)"
 	@echo "  clean      - Destroy cluster state (Linux: k3s binary kept; make up restarts it)"
 	@echo ""

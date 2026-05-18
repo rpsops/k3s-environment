@@ -100,7 +100,7 @@ provision:
       # Configure k3s registry mirror so containerd (running on the node) can
       # resolve zot.registry.svc.cluster.local:5000 — a Kubernetes DNS name only
       # resolvable inside pods, not by the node's system resolver.  We map it to
-      # the Zot NodePort (fixed at 30500 via the Zot HelmRelease service.nodePort).
+      # the Zot NodePort (fixed at 30500 via the Zot ArgoCD Application service.nodePort).
       mkdir -p /etc/rancher/k3s
       printf 'mirrors:\n  "zot.registry.svc.cluster.local:5000":\n    endpoint:\n      - "http://localhost:30500"\nconfigs:\n  "zot.registry.svc.cluster.local:5000":\n    tls:\n      insecure: true\n' \
         > /etc/rancher/k3s/registries.yaml

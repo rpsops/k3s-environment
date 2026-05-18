@@ -1,7 +1,7 @@
 FROM ubuntu:24.04 AS toolbox
 
 ARG TARGETARCH=amd64
-ARG FLUX_VERSION=2.4.0
+ARG ARGOCD_VERSION=2.13.3
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -27,8 +27,9 @@ RUN curl -fsSL \
 RUN curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
 RUN curl -fsSL \
-    "https://github.com/fluxcd/flux2/releases/download/v${FLUX_VERSION}/flux_${FLUX_VERSION}_linux_${TARGETARCH}.tar.gz" \
-    | tar -xz -C /usr/local/bin flux
+    "https://github.com/argoproj/argo-cd/releases/download/v${ARGOCD_VERSION}/argocd-linux-${TARGETARCH}" \
+    -o /usr/local/bin/argocd \
+    && chmod +x /usr/local/bin/argocd
 
 RUN KUBESEAL_VER=$(curl -fsSL https://api.github.com/repos/bitnami-labs/sealed-secrets/releases/latest \
         | jq -r '.tag_name | ltrimstr("v")') \
