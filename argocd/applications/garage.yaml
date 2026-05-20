@@ -8,7 +8,7 @@ spec:
   source:
     repoURL: https://deimosfr.github.io/deimosfr-charts/
     chart: garage
-    targetRevision: "*"
+    targetRevision: ">=2.0.0 <3.0.0"
     helm:
       values: |
         image:

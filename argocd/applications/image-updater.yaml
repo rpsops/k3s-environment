@@ -8,7 +8,7 @@ spec:
   source:
     repoURL: https://argoproj.github.io/argo-helm
     chart: argocd-image-updater
-    targetRevision: "*"
+    targetRevision: ">=1.0.0 <2.0.0"
     helm:
       values: |
         config:
