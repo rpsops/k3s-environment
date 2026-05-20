@@ -73,7 +73,7 @@
     kubectl create configmap argocd-cm -n argocd
   changed_when: false
 
-# --- Infrastructure: namespaces ---
+# --- Infrastructure: namespaces (imperative bootstrap) ---
 
 - name: Apply namespaces
   ansible.builtin.command: kubectl apply -k {{ argocd_base_path }}/infrastructure/namespaces
@@ -95,22 +95,52 @@
     kubectl rollout restart deployment coredns -n kube-system
     sleep 20
 
-# --- cert-manager ---
+# --- git-server (bootstrap - must precede root app) ---
 
-- name: Apply cert-manager Application
-  ansible.builtin.command: kubectl apply -f {{ argocd_base_path }}/applications/cert-manager.yaml
-  register: cm_apply
-  changed_when: "'configured' in cm_apply.stdout or 'created' in cm_apply.stdout"
+- name: Deploy git-server namespace
+  ansible.builtin.command: kubectl apply -f {{ argocd_base_path }}/infrastructure/git-server/namespace.yaml
+  register: gs_ns_apply
+  changed_when: "'configured' in gs_ns_apply.stdout or 'created' in gs_ns_apply.stdout"
 
-- name: Wait for cert-manager to be ready
+- name: Deploy git-server
+  ansible.builtin.command: kubectl apply -f {{ argocd_base_path }}/infrastructure/git-server/
+  register: gs_apply
+  changed_when: "'configured' in gs_apply.stdout or 'created' in gs_apply.stdout"
+
+- name: Wait for git-server
   ansible.builtin.command: >
-    kubectl wait deploy/cert-manager-webhook -n cert-manager
-    --for=condition=available --timeout=300s
+    kubectl wait deploy/git-server -n git-server
+    --for=condition=available --timeout=120s
   changed_when: false
-  retries: 10
-  delay: 20
-  register: cm_ready
-  until: cm_ready.rc == 0
+
+- name: Init infra bare repo on git-server
+  ansible.builtin.shell: |
+    POD=$(kubectl get pod -n git-server -l app=git-server -o jsonpath='{.items[0].metadata.name}')
+    kubectl exec -n git-server $POD -- bash -c \
+      "[ -d /repos/infra ] && echo exists || (git init --bare /repos/infra && echo created)"
+  register: repo_init
+  changed_when: "'created' in repo_init.stdout"
+
+- name: Push argocd to git-server
+  ansible.builtin.shell: |
+    POD=$(kubectl get pod -n git-server -l app=git-server -o jsonpath='{.items[0].metadata.name}')
+    kubectl cp {{ argocd_base_path }}/ git-server/${POD}:/tmp/argocd-src/
+    kubectl exec -n git-server $POD -- bash -c "
+      rm -rf /tmp/infra-push && mkdir /tmp/infra-push && cd /tmp/infra-push &&
+      git init && git config user.email 'bootstrap@localhost' && git config user.name 'bootstrap' &&
+      cp -r /tmp/argocd-src/. . &&
+      git add . && git commit -m 'bootstrap' &&
+      git push /repos/infra HEAD:main --force &&
+      chown -R www-data:www-data /repos/infra
+    "
+  changed_when: true
+
+- name: Apply root app
+  ansible.builtin.command: kubectl apply -f {{ argocd_base_path }}/root-app.yaml
+  register: root_apply
+  changed_when: "'configured' in root_apply.stdout or 'created' in root_apply.stdout"
+
+# --- mkcert CA ---
 
 - name: Get mkcert CA root path
   ansible.builtin.command: mkcert -CAROOT
@@ -124,20 +154,6 @@
   changed_when: false
   environment:
     TRUST_STORES: nss
-
-- name: Apply ClusterIssuer for mkcert CA
-  ansible.builtin.command: kubectl apply -f {{ argocd_base_path }}/infrastructure/cert-manager/clusterissuer.yaml
-  register: ci_apply
-  changed_when: "'configured' in ci_apply.stdout or 'created' in ci_apply.stdout"
-
-- name: Create mkcert CA secret in cert-manager namespace
-  ansible.builtin.shell: |
-    kubectl create secret tls mkcert-ca \
-      --cert="{{ mkcert_caroot.stdout }}/rootCA.pem" \
-      --key="{{ mkcert_caroot.stdout }}/rootCA-key.pem" \
-      -n cert-manager --dry-run=client -o yaml | kubectl apply -f -
-  register: ca_secret
-  changed_when: "'configured' in ca_secret.stdout or 'created' in ca_secret.stdout"
 
 # --- Sealed Secrets ---
 
@@ -171,22 +187,42 @@
       The controller will generate a fresh key on first start.
       Run 'make sealed-secrets-key-export' to persist it for future rebuilds.
 
-- name: Apply sealed-secrets Application
-  ansible.builtin.command: kubectl apply -f {{ argocd_base_path }}/applications/sealed-secrets.yaml
-  register: ss_apply
-  changed_when: "'configured' in ss_apply.stdout or 'created' in ss_apply.stdout"
+# --- Wait for cert-manager (ArgoCD wave 0) then apply CA secret ---
 
-- name: Wait for sealed-secrets controller to be ready
-  ansible.builtin.command: >
-    kubectl wait deploy/sealed-secrets -n kube-system
-    --for=condition=available --timeout=300s
+- name: Wait for cert-manager (ArgoCD wave 0)
+  ansible.builtin.shell: |
+    for i in $(seq 1 30); do
+      if kubectl get deploy/cert-manager-webhook -n cert-manager >/dev/null 2>&1; then
+        kubectl wait deploy/cert-manager-webhook -n cert-manager \
+          --for=condition=available --timeout=300s && exit 0
+      fi
+      sleep 20
+    done
+    exit 1
   changed_when: false
-  retries: 15
-  delay: 15
-  register: ss_ready
-  until: ss_ready.rc == 0
 
-# --- Seal secrets ---
+- name: Create mkcert CA secret in cert-manager namespace
+  ansible.builtin.shell: |
+    kubectl create secret tls mkcert-ca \
+      --cert="{{ mkcert_caroot.stdout }}/rootCA.pem" \
+      --key="{{ mkcert_caroot.stdout }}/rootCA-key.pem" \
+      -n cert-manager --dry-run=client -o yaml | kubectl apply -f -
+  register: ca_secret
+  changed_when: "'configured' in ca_secret.stdout or 'created' in ca_secret.stdout"
+
+# --- Wait for sealed-secrets (ArgoCD wave 1) then seal secrets ---
+
+- name: Wait for sealed-secrets (ArgoCD wave 1)
+  ansible.builtin.shell: |
+    for i in $(seq 1 30); do
+      if kubectl get deploy/sealed-secrets -n kube-system >/dev/null 2>&1; then
+        kubectl wait deploy/sealed-secrets -n kube-system \
+          --for=condition=available --timeout=300s && exit 0
+      fi
+      sleep 20
+    done
+    exit 1
+  changed_when: false
 
 - name: Check if Grafana admin secret exists
   ansible.builtin.command: kubectl get secret grafana-admin -n monitoring
@@ -204,68 +240,6 @@
       -n monitoring --dry-run=client -o yaml | \
     kubeseal --controller-name=sealed-secrets --controller-namespace=kube-system --format yaml | kubectl apply -f -
   changed_when: true
-
-# --- Deploy remaining infrastructure ---
-
-- name: Apply infrastructure Applications (first pass)
-  ansible.builtin.command: kubectl apply -f {{ argocd_base_path }}/applications/{{ item }}
-  loop:
-    - garage.yaml
-    - kube-prometheus-stack.yaml
-    - loki.yaml
-    - vector.yaml
-    - strimzi.yaml
-    - registry.yaml
-    - kyverno.yaml
-  register: infra_apply
-  changed_when: "'configured' in infra_apply.stdout or 'created' in infra_apply.stdout"
-  failed_when: false
-
-- name: Wait for infra Applications to be healthy
-  ansible.builtin.command: >
-    argocd --core --namespace argocd app wait {{ item }} --health --sync --timeout 600
-  loop:
-    - garage
-    - registry
-    - kyverno
-    - strimzi
-  register: infra_wait
-  changed_when: false
-  retries: 3
-  delay: 10
-  until: infra_wait.rc == 0
-  failed_when: false
-
-- name: Apply infrastructure (second pass - CRDs now available)
-  ansible.builtin.command: kubectl apply -f {{ argocd_base_path }}/applications/{{ item }}
-  loop:
-    - cilium.yaml
-    - kube-prometheus-stack.yaml
-  register: infra_apply2
-  changed_when: "'configured' in infra_apply2.stdout or 'created' in infra_apply2.stdout"
-
-- name: Apply Cilium plain manifests (gateway, certificate, routes)
-  ansible.builtin.shell: |
-    kubectl apply -f {{ argocd_base_path }}/infrastructure/cilium/
-    kubectl apply -f {{ argocd_base_path }}/infrastructure/registry/ingress.yaml
-    kubectl apply -f {{ argocd_base_path }}/infrastructure/monitoring/
-    kubectl apply -f {{ argocd_base_path }}/infrastructure/kyverno/
-    kubectl apply -f {{ argocd_base_path }}/infrastructure/argocd-route.yaml
-  register: plain_apply
-  changed_when: "'configured' in plain_apply.stdout or 'created' in plain_apply.stdout"
-
-- name: Apply git-server manifests
-  ansible.builtin.shell: kubectl apply -f {{ argocd_base_path }}/infrastructure/git-server/
-  register: gitserver_apply
-  changed_when: "'configured' in gitserver_apply.stdout or 'created' in gitserver_apply.stdout"
-
-# --- Image Updater ---
-
-- name: Apply Image Updater Application
-  ansible.builtin.command: kubectl apply -f {{ argocd_base_path }}/applications/image-updater.yaml
-  register: iu_apply
-  changed_when: "'configured' in iu_apply.stdout or 'created' in iu_apply.stdout"
-  failed_when: false
 
 # --- Cosign ---
 
@@ -314,7 +288,7 @@
 # --- Status ---
 
 - name: Show status
-  ansible.builtin.shell: argocd --core --namespace argocd app list
+  ansible.builtin.shell: kubectl get applications -n argocd
   register: final_status
   changed_when: false
   failed_when: false

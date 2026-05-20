@@ -1,22 +1,19 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: strimzi
+  name: monitoring-config
   namespace: argocd
   annotations:
-    argocd.argoproj.io/sync-wave: "2"
+    argocd.argoproj.io/sync-wave: "5"
 spec:
   project: default
   source:
-    repoURL: https://strimzi.io/charts/
-    chart: strimzi-kafka-operator
-    targetRevision: ">=1.0.0 <2.0.0"
-    helm:
-      values: |
-        watchAnyNamespace: true
+    repoURL: http://git-server.git-server.svc.cluster.local/infra
+    targetRevision: main
+    path: infrastructure/monitoring
   destination:
     server: https://kubernetes.default.svc
-    namespace: kafka
+    namespace: monitoring
   syncPolicy:
     automated:
       prune: true

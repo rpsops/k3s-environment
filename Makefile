@@ -26,7 +26,7 @@ KUBECTL  := kubectl
 endif
 
 .PHONY: build setup setup-macos setup-linux install-shims up up-macos up-linux \
-	sync sync-apps reconcile status stop clean help \
+	sync infra-push sync-apps reconcile status stop clean help \
 	sealed-secrets-key-export sealed-secrets-key-restore \
 	cosign-key-export cosign-key-restore \
 	gitops-credentials-export gitops-credentials-restore
@@ -62,26 +62,25 @@ setup-linux:
 	@printf 'mirrors:\n  "zot.registry.svc.cluster.local:5000":\n    endpoint:\n      - "http://localhost:30500"\n' \
 		| sudo tee /etc/rancher/k3s/registries.yaml > /dev/null
 	@echo "Registry mirror: zot.registry.svc.cluster.local:5000 → http://localhost:30500"
-	@if [ ! -f /usr/local/bin/k3s ]; then \
-		echo "Installing k3s..."; \
-		curl -sfL https://get.k3s.io | \
-		sudo env INSTALL_K3S_EXEC="--disable=traefik --disable=servicelb \
+	@K3S_FLAGS="--disable=traefik --disable=servicelb \
 		  --flannel-backend=none --disable-network-policy \
 		  --disable-kube-proxy --write-kubeconfig-mode 644 \
 		  --tls-san host.docker.internal \
-		  --resolv-conf /run/systemd/resolve/resolv.conf" \
-		sh -; \
-		mkdir -p ~/.kube; \
-		sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config; \
-		sudo chown "$$(id -u):$$(id -g)" ~/.kube/config; \
-		chmod 600 ~/.kube/config; \
+		  --resolv-conf /run/systemd/resolve/resolv.conf"; \
+	if [ ! -f /usr/local/bin/k3s ]; then \
+		echo "Installing k3s..."; \
+		curl -sfL https://get.k3s.io | sudo env INSTALL_K3S_EXEC="$$K3S_FLAGS" sh -; \
 		echo "fs.inotify.max_user_instances=512"   | sudo tee    /etc/sysctl.d/99-inotify.conf > /dev/null; \
 		echo "fs.inotify.max_user_watches=524288"  | sudo tee -a /etc/sysctl.d/99-inotify.conf > /dev/null; \
 		sudo sysctl --system; \
 	else \
-		echo "Restarting k3s to reload registries.yaml..."; \
-		sudo systemctl restart k3s; \
-	fi
+		echo "Updating k3s service flags..."; \
+		curl -sfL https://get.k3s.io | sudo env INSTALL_K3S_SKIP_DOWNLOAD=true INSTALL_K3S_EXEC="$$K3S_FLAGS" sh -; \
+	fi; \
+	mkdir -p ~/.kube; \
+	sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config; \
+	sudo chown "$$(id -u):$$(id -g)" ~/.kube/config; \
+	chmod 600 ~/.kube/config
 	@sudo mkdir -p /etc/systemd/resolved.conf.d
 	@printf '[Resolve]\nDNS=127.0.0.1:%s\nDomains=~dev.local\n' "$(DNS_PORT)" \
 		| sudo tee /etc/systemd/resolved.conf.d/dev-local.conf > /dev/null
@@ -216,18 +215,23 @@ up-linux:
 		echo "CA trusted system-wide (curl, wget, etc.)"; \
 	fi
 
-## Re-apply ArgoCD Applications and plain infra manifests after editing argocd/ files
+## Push argocd/ to git-server; ArgoCD picks up changes automatically
 sync:
-	$(KUBECTL) apply -k argocd/infrastructure/namespaces/
-	$(KUBECTL) apply -f argocd/applications/
-	$(KUBECTL) apply -f argocd/infrastructure/cert-manager/clusterissuer.yaml
-	$(KUBECTL) apply -f argocd/infrastructure/cilium/
-	$(KUBECTL) apply -f argocd/infrastructure/kyverno/
-	$(KUBECTL) apply -f argocd/infrastructure/monitoring/
-	$(KUBECTL) apply -f argocd/infrastructure/registry/ingress.yaml
-	$(KUBECTL) apply -f argocd/infrastructure/git-server/
-	$(KUBECTL) apply -f argocd/infrastructure/argocd-route.yaml
-	$(ARGOCD) app sync --all
+	$(MAKE) infra-push
+	$(ARGOCD) app sync infra
+
+## Push argocd/ contents to the in-cluster git-server (accepts uncommitted changes)
+infra-push:
+	@POD=$$($(KUBECTL) get pod -n git-server -l app=git-server \
+		-o jsonpath='{.items[0].metadata.name}'); \
+	$(KUBECTL) cp argocd/ git-server/$${POD}:/tmp/argocd-src/; \
+	$(KUBECTL) exec -n git-server $${POD} -- bash -c "\
+	  rm -rf /tmp/infra-push && mkdir /tmp/infra-push && cd /tmp/infra-push && \
+	  git init && git config user.email 'sync@localhost' && git config user.name 'sync' && \
+	  cp -r /tmp/argocd-src/. . && \
+	  git add . && (git diff --cached --quiet && echo 'no changes' || git commit -m 'sync') && \
+	  git push /repos/infra HEAD:main --force && \
+	  chown -R www-data:www-data /repos/infra"
 
 ## Force ArgoCD to re-sync every apps-* Application registered by tenants
 sync-apps:
@@ -235,8 +239,9 @@ sync-apps:
 		$(ARGOCD) app sync $$app; \
 	done
 
-## Force ArgoCD to re-sync all infra Applications immediately
+## Force ArgoCD to re-sync all Applications immediately
 reconcile:
+	$(ARGOCD) app sync infra
 	$(ARGOCD) app sync --all
 
 ## Re-write a single namespace's PAT Secret manifest
@@ -346,6 +351,8 @@ else
 	@if [ -f /usr/local/bin/k3s-killall.sh ]; then sudo k3s-killall.sh; fi
 	@sudo ip link delete cilium_host 2>/dev/null || true
 	@sudo ip link delete cilium_vxlan 2>/dev/null || true
+	@sudo ip link delete flannel.1 2>/dev/null || true
+	@sudo ip link delete cni0 2>/dev/null || true
 	@sudo rm -rf /var/lib/rancher/k3s/
 	@for tbl in nat filter mangle raw; do \
 		for chain in $$(sudo iptables -t $$tbl -L -n 2>/dev/null | awk '/^Chain (CILIUM|OLD_CILIUM)/{print $$2}'); do \
@@ -364,7 +371,8 @@ help:
 	@echo "  build      - Build the k3s-toolbox Docker image"
 	@echo "  setup      - One-time setup (sudo): DNS + k3s (Linux) + shims"
 	@echo "  up         - Start k3s and deploy cluster via ArgoCD (no sudo)"
-	@echo "  sync       - Re-apply ArgoCD Applications and namespaces"
+	@echo "  sync       - Push argocd/ to git-server; ArgoCD auto-syncs"
+	@echo "  infra-push - Push argocd/ to git-server (no ArgoCD sync trigger)"
 	@echo "  sync-apps  - Force ArgoCD to re-sync tenant apps-* Applications"
 	@echo "  reconcile  - Force ArgoCD to re-sync all Applications"
 	@echo "  status     - Show ArgoCD Application status"
