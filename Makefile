@@ -62,9 +62,7 @@ setup-linux:
 	@printf 'mirrors:\n  "zot.registry.svc.cluster.local:5000":\n    endpoint:\n      - "http://localhost:30500"\n' \
 		| sudo tee /etc/rancher/k3s/registries.yaml > /dev/null
 	@echo "Registry mirror: zot.registry.svc.cluster.local:5000 → http://localhost:30500"
-	@K3S_FLAGS="--disable=traefik --disable=servicelb \
-		  --flannel-backend=none --disable-network-policy \
-		  --disable-kube-proxy --write-kubeconfig-mode 644 \
+	@K3S_FLAGS="--disable=traefik --write-kubeconfig-mode 644 \
 		  --tls-san host.docker.internal \
 		  --resolv-conf /run/systemd/resolve/resolv.conf"; \
 	if [ ! -f /usr/local/bin/k3s ]; then \
@@ -81,6 +79,9 @@ setup-linux:
 	sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config; \
 	sudo chown "$$(id -u):$$(id -g)" ~/.kube/config; \
 	chmod 600 ~/.kube/config
+	@sudo iptables -C DOCKER-USER -s 10.42.0.0/16 -j ACCEPT 2>/dev/null || sudo iptables -I DOCKER-USER -s 10.42.0.0/16 -j ACCEPT
+	@sudo iptables -C DOCKER-USER -d 10.42.0.0/16 -j ACCEPT 2>/dev/null || sudo iptables -I DOCKER-USER -d 10.42.0.0/16 -j ACCEPT
+	@echo "iptables: Flannel pod CIDR (10.42.0.0/16) allowed in FORWARD"
 	@sudo mkdir -p /etc/systemd/resolved.conf.d
 	@printf '[Resolve]\nDNS=127.0.0.1:%s\nDomains=~dev.local\n' "$(DNS_PORT)" \
 		| sudo tee /etc/systemd/resolved.conf.d/dev-local.conf > /dev/null
@@ -185,14 +186,15 @@ up-linux:
 	@docker exec $(CONTAINER) \
 		ansible-playbook -i ansible/inventory/localhost.yml ansible/playbook.yml
 	@# k3s is on the host; ClusterIP is directly routable
-	@GATEWAY_IP=$$($(KUBECTL) get svc cilium-gateway-dev-local -n default \
-		-o jsonpath='{.spec.clusterIP}' 2>/dev/null); \
+	@GATEWAY_IP=$$($(KUBECTL) get svc dev-local-istio -n default -o jsonpath='{.spec.clusterIP}' 2>/dev/null || \
+	              $(KUBECTL) get svc cilium-gateway-dev-local -n default -o jsonpath='{.spec.clusterIP}' 2>/dev/null); \
 	if [ -z "$$GATEWAY_IP" ] || [ "$$GATEWAY_IP" = "None" ]; then \
-		echo "WARNING: could not get Cilium gateway ClusterIP; DNS not configured"; \
+		echo "ERROR: could not get gateway ClusterIP; DNS not configured"; \
+		exit 1; \
 	else \
 		printf 'port=$(DNS_PORT)\nno-resolv\naddress=/dev.local/%s\n' "$$GATEWAY_IP" \
 			> .local/dnsmasq.conf; \
-		echo "DNS: *.dev.local → $$GATEWAY_IP (Cilium gateway ClusterIP)"; \
+		echo "DNS: *.dev.local → $$GATEWAY_IP (Gateway ClusterIP)"; \
 	fi
 	@docker rm -f $(DNS_CONTAINER) 2>/dev/null || true
 	@docker run -d --name $(DNS_CONTAINER) \
@@ -328,6 +330,7 @@ status:
 
 ## Stop k3s and toolbox containers (preserves data)
 stop:
+	@kubectl delete mutatingwebhookconfigurations,validatingwebhookconfigurations --all 2>/dev/null || true
 	@docker stop $(CONTAINER) $(DNS_CONTAINER) 2>/dev/null || true
 ifeq ($(OS), Darwin)
 	@if limactl list 2>/dev/null | grep -q '^k3s.*Running'; then \
@@ -349,17 +352,40 @@ ifeq ($(OS), Darwin)
 	@rm -f ~/.kube/config
 else
 	@if [ -f /usr/local/bin/k3s-killall.sh ]; then sudo k3s-killall.sh; fi
+	@sudo rm -f /etc/cni/net.d/05-cilium.conflist /etc/cni/net.d/10-flannel.conflist 2>/dev/null || true
+	@sudo rm -rf /sys/fs/bpf/cilium 2>/dev/null || true
+	@sudo rm -f /sys/fs/bpf/tc/globals/cilium_* 2>/dev/null || true
+	@sudo ip rule del fwmark 0x200/0xf00 2>/dev/null || true
+	@sudo ip route flush table 2004 2>/dev/null || true
+	@sudo ip route flush table 2005 2>/dev/null || true
 	@sudo ip link delete cilium_host 2>/dev/null || true
 	@sudo ip link delete cilium_vxlan 2>/dev/null || true
 	@sudo ip link delete flannel.1 2>/dev/null || true
 	@sudo ip link delete cni0 2>/dev/null || true
 	@sudo rm -rf /var/lib/rancher/k3s/
+	@if command -v bpftool >/dev/null 2>&1; then \
+		sudo bpftool cgroup show /sys/fs/cgroup 2>/dev/null | grep -E "cil_" | while read -r id type flags name; do \
+			sudo bpftool cgroup detach /sys/fs/cgroup "$$type" id "$$id" 2>/dev/null || true; \
+		done; \
+		sudo bpftool net show 2>/dev/null | grep -E "tcx/(ingress|egress)" | grep -E "cil_" | while read -r dev type name rest; do \
+			iface=$$(echo "$$dev" | cut -d'(' -f1); \
+			att_type=$$(echo "$$type" | sed 's/\//_/g'); \
+			sudo bpftool net detach "$$att_type" dev "$$iface" 2>/dev/null || true; \
+		done; \
+	fi
+	@sudo iptables -t nat -D PREROUTING -m comment --comment "cilium-feeder: CILIUM_PRE_nat" -j CILIUM_PRE_nat 2>/dev/null || true
+	@sudo iptables -t nat -D OUTPUT -m comment --comment "cilium-feeder: CILIUM_OUTPUT_nat" -j CILIUM_OUTPUT_nat 2>/dev/null || true
+	@sudo iptables -t nat -D POSTROUTING -m comment --comment "cilium-feeder: CILIUM_POST_nat" -j CILIUM_POST_nat 2>/dev/null || true
+	@sudo iptables -t filter -D INPUT -m comment --comment "cilium-feeder: CILIUM_INPUT" -j CILIUM_INPUT 2>/dev/null || true
+	@sudo iptables -t filter -D FORWARD -m comment --comment "cilium-feeder: CILIUM_FORWARD" -j CILIUM_FORWARD 2>/dev/null || true
+	@sudo iptables -t filter -D OUTPUT -m comment --comment "cilium-feeder: CILIUM_OUTPUT" -j CILIUM_OUTPUT 2>/dev/null || true
+	@sudo iptables -t mangle -D PREROUTING -m comment --comment "cilium-feeder: CILIUM_PRE_mangle" -j CILIUM_PRE_mangle 2>/dev/null || true
+	@sudo iptables -t mangle -D POSTROUTING -m comment --comment "cilium-feeder: CILIUM_POST_mangle" -j CILIUM_POST_mangle 2>/dev/null || true
+	@sudo iptables -t raw -D PREROUTING -m comment --comment "cilium-feeder: CILIUM_PRE_raw" -j CILIUM_PRE_raw 2>/dev/null || true
+	@sudo iptables -t raw -D OUTPUT -m comment --comment "cilium-feeder: CILIUM_OUTPUT_raw" -j CILIUM_OUTPUT_raw 2>/dev/null || true
 	@for tbl in nat filter mangle raw; do \
 		for chain in $$(sudo iptables -t $$tbl -L -n 2>/dev/null | awk '/^Chain (CILIUM|OLD_CILIUM)/{print $$2}'); do \
 			sudo iptables -t $$tbl -F $$chain 2>/dev/null || true; \
-		done; \
-		for chain in $$(sudo iptables -t $$tbl -L -n 2>/dev/null | awk '/^Chain (CILIUM|OLD_CILIUM)/{print $$2}'); do \
-			sudo iptables -t $$tbl -D $$tbl $$chain 2>/dev/null || true; \
 			sudo iptables -t $$tbl -X $$chain 2>/dev/null || true; \
 		done; \
 	done

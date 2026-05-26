@@ -1,16 +1,16 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: cilium-config
+  name: gateway-api
   namespace: argocd
   annotations:
-    argocd.argoproj.io/sync-wave: "5"
+    argocd.argoproj.io/sync-wave: "2"
 spec:
   project: default
   source:
     repoURL: http://git-server.git-server.svc.cluster.local/infra
     targetRevision: main
-    path: infrastructure/cilium
+    path: infrastructure/gateway-api
   destination:
     server: https://kubernetes.default.svc
     namespace: default
