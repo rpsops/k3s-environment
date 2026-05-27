@@ -1,0 +1,44 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: registry
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: https://zotregistry.dev/helm-charts
+    chart: zot
+    targetRevision: ">=0.1.0 <0.2.0"
+    helm:
+      values: |
+        persistence: true
+        pvc:
+          create: true
+          storage: 20Gi
+        service:
+          nodePort: 30500
+        mountConfig: true
+        configFiles:
+          config.json: |-
+            {
+              "storage": { "rootDirectory": "/var/lib/registry" },
+              "http": {
+                "address": "0.0.0.0",
+                "port": "5000",
+                "compat": ["docker2s2"]
+              },
+              "log": { "level": "info" },
+              "extensions": {
+                "search": { "enable": true },
+                "ui":     { "enable": true }
+              }
+            }
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: registry
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

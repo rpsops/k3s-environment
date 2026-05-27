@@ -1,11 +1,11 @@
 ---
 # Runs inside the k3s-toolbox container (docker exec k3s-toolbox ansible-playbook ...)
 # k3s startup, DNS setup, and CA trust are handled by the Makefile.
-- name: Deploy cluster infrastructure via Flux
+- name: Deploy cluster infrastructure via ArgoCD
   hosts: localhost
   connection: local
   gather_facts: true
   become: false
 
   roles:
-    - flux
+    - argocd

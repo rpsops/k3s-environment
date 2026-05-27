@@ -7,13 +7,12 @@ lima_vm_name: k3s
 lima_config: "{{ playbook_dir }}/../lima-k3s.yaml"
 
 # Tool versions (Linux binary installs)
-flux_version: "2.4.0"
+argocd_version: "2.13.3"
 nerdctl_version: "2.0.3"
 buildkit_version: "0.17.1"
 
-# Flux
-flux_base_path: "{{ playbook_dir }}/../flux"
-flux_manifests_path: "{{ playbook_dir }}/../flux/clusters/dev"
+# ArgoCD
+argocd_base_path: "{{ playbook_dir }}/../argocd"
 
 # kubeconfig
 kubeconfig_path: "{{ ansible_facts['env']['HOME'] }}/.kube/config"

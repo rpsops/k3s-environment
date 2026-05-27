@@ -1,0 +1,29 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: argocd-image-updater
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  project: default
+  source:
+    repoURL: https://argoproj.github.io/argo-helm
+    chart: argocd-image-updater
+    targetRevision: ">=1.0.0 <2.0.0"
+    helm:
+      values: |
+        config:
+          registries:
+            - name: zot
+              prefix: zot.registry.svc.cluster.local:5000
+              api_url: http://zot.registry.svc.cluster.local:5000
+              insecure: true
+              default: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

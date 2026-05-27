@@ -1,6 +1,6 @@
 # k3s-environment
 
-Local Kubernetes environment using Lima (macOS) / k3s (Linux), Flux GitOps, and Cilium.
+Local Kubernetes environment using Lima (macOS) / k3s (Linux), ArgoCD GitOps, and Cilium.
 
 This repo is **infrastructure only**. It knows nothing about tenants. Tenant gitops repos self-register.
 
@@ -10,11 +10,11 @@ This repo is **infrastructure only**. It knows nothing about tenants. Tenant git
 ┌──────────────────────────────────────────────────────────────────┐
 │                        k3s-environment                           │
 │                                                                  │
-│  Cilium · Gateway API · cert-manager · Sealed Secrets · Flux    │
+│  Cilium · Gateway API · cert-manager · Sealed Secrets · ArgoCD  │
 │  Zot (registry) · Strimzi (Kafka op) · Kyverno · Monitoring    │
 │  git-server (in-cluster HTTP git)                                │
 └────────────────────┬─────────────────────────┬───────────────────┘
-                     │ Flux reconciles          │ Flux reconciles
+                     │ ArgoCD reconciles        │ ArgoCD reconciles
           ┌──────────┴──────────┐   ┌──────────┴──────────┐
           │   wallet-hsm ns     │   │   other-tenant ns   │   ...
           └──────────▲──────────┘   └──────────▲──────────┘
@@ -59,7 +59,7 @@ Besides Docker and the Lima VM, `make setup` + `make up` leave four things on th
 | What | Where | Written by |
 |------|-------|------------|
 | DNS resolver delegation | `/etc/resolver/dev.local` | `make setup` (sudo) |
-| Tool shims (kubectl, helm, flux, cosign, kubeseal, yq, jq) | `~/.local/bin/` | `make setup` |
+| Tool shims (kubectl, helm, argocd, cosign, kubeseal, yq, jq) | `~/.local/bin/` | `make setup` |
 | mkcert CA trusted by the OS | macOS Keychain / Linux NSS store | `make up` |
 | Kubeconfig for the toolbox container | `.local/toolbox-kubeconfig` | `make up` |
 
@@ -74,11 +74,11 @@ Both Docker containers (`k3s-toolbox` and `k3s-dnsmasq`) are started by `make up
 | Target | Description | Sudo |
 |--------|-------------|------|
 | `make setup` | One-time: DNS, k3s (Linux), shims | yes |
-| `make up` | Start cluster, deploy infra via Flux | no |
-| `make sync` | Re-apply `flux/infrastructure/` manifests | no |
-| `make sync-apps` | Force Flux to re-pull all gitops repos | no |
-| `make reconcile` | Force all HelmReleases to reconcile | no |
-| `make status` | Flux sources, kustomizations, HelmReleases | no |
+| `make up` | Start cluster, deploy infra via ArgoCD | no |
+| `make sync` | Re-apply `argocd/applications/` and namespaces | no |
+| `make sync-apps` | Force ArgoCD to re-sync tenant apps-* Applications | no |
+| `make reconcile` | Force all ArgoCD Applications to re-sync | no |
+| `make status` | ArgoCD Application status | no |
 | `make stop` | Stop cluster (preserves data) | no |
 | `make clean` | Destroy cluster completely | no |
 | `make sealed-secrets-key-export` | Save master key to `.local/` | no |
@@ -103,7 +103,7 @@ make cosign-key-export           # → .local/cosign-key.yaml
 
 `.local/` is gitignored. On next `make up`, Ansible restores both automatically if the files exist.
 
-If the cosign key changes, update the public key in `flux/infrastructure/kyverno/verify-internal-images.yaml`.
+If the cosign key changes, update the public key in `argocd/infrastructure/kyverno/verify-internal-images.yaml`.
 
 ## Full test sequence
 
@@ -116,18 +116,18 @@ End-to-end walkthrough using `wallet-accessmechanism-gitops` (gitops repo) and `
 make clean && make up
 ```
 
-`make up` waits until all infrastructure HelmReleases are Ready before returning.
+`make up` waits until all infrastructure ArgoCD Applications are Healthy before returning.
 
 ### 2. Register the gitops tenant
 
 ```bash
 # In wallet-accessmechanism-gitops/
 make k3s-push       # initialises bare repo on git-server and force-pushes
-make k3s-register   # creates Namespace + GitRepository + Kustomization in Flux,
-                    # then waits for Flux to fetch the repo and apply the kustomization
+make k3s-register   # creates Namespace + ArgoCD Application,
+                    # then waits for ArgoCD to sync and apply the manifests
 ```
 
-`make k3s-register` blocks until the kustomization is Applied — all tenant resources
+`make k3s-register` blocks until the Application is Synced — all tenant resources
 (Kafka cluster, Valkey, HelmReleases, SealedSecrets, …) exist in the cluster before it returns.
 
 ### 3. Build and deploy images
@@ -144,11 +144,11 @@ Builds `rust-wallet-bff` and `rust-hsm-worker` and pushes them to the in-cluster
 
 ```bash
 # In wallet-accessmechanism-gitops/
-make k3s-rollout   # bumps timestamp annotation, commits, tags, pushes → Flux applies → rollout status
+make k3s-rollout   # bumps timestamp annotation, commits, tags, pushes → ArgoCD applies → rollout status
 ```
 
 Bumps `rollout-authorized-at` on both StatefulSet pod templates, commits, creates a `rollout/...` git tag,
-pushes to the in-cluster git server, triggers Flux reconciliation, and waits for the rollout to complete.
+pushes to the in-cluster git server, triggers ArgoCD reconciliation, and waits for the rollout to complete.
 
 ### 5. Smoke test — wallet-bff → Kafka → hsm-worker round-trip
 
@@ -172,7 +172,7 @@ a `devAuthorizationCode`, and a `serverJwsPublicKey` from hsm-worker.
 
 ```bash
 # In wallet-accessmechanism-gitops/
-make k3s-unregister   # deletes Flux registration, strips Strimzi finalizers, waits for namespace gone
+make k3s-unregister   # deletes ArgoCD Application, strips Strimzi finalizers, waits for namespace gone
 ```
 
 `make k3s-unregister` blocks until the namespace has fully terminated, so
@@ -182,11 +182,12 @@ make k3s-unregister   # deletes Flux registration, strips Strimzi finalizers, wa
 
 | Service | URL |
 |---------|-----|
-| Grafana | https://grafana.dev.local |
-| Hubble | https://hubble.dev.local |
-| KafBat | https://kafbat.dev.local |
-| Headlamp | https://headlamp.dev.local |
-| Zot registry | https://registry.dev.local |
+| ArgoCD | http://argocd.dev.local:8080 |
+| Grafana | https://grafana.dev.local:8443 |
+| Hubble | https://hubble.dev.local:8443 |
+| KafBat | https://kafbat.dev.local:8443 |
+| Headlamp | https://headlamp.dev.local:8443 |
+| Zot registry | https://registry.dev.local:8443 |
 | Git server | http://git.dev.local:8080 |
 
 All `*.dev.local` resolved via dnsmasq. TLS via mkcert local CA (trusted by `make setup`).

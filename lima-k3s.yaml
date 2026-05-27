@@ -30,7 +30,7 @@ portForwards:
     hostPort: 6443
     hostIP: "0.0.0.0"
     proto: tcp
-  # HTTP ingress: forward only the IPv4-wildcard binding (socat uses bind=0.0.0.0);
+  # HTTP ingress: forward only the IPv4-wildcard binding (ServiceLB binds 0.0.0.0);
   # ignore IPv6/loopback variants to prevent Lima from racing on the host port.
   - guestIP: "0.0.0.0"
     guestPort: 8080
@@ -42,7 +42,7 @@ portForwards:
   - guestIP: "127.0.0.1"
     guestPort: 8080
     ignore: true
-  # HTTPS ingress — same pattern
+  # HTTPS ingress — same pattern (ServiceLB binds 0.0.0.0)
   - guestIP: "0.0.0.0"
     guestPort: 8443
     hostPort: 8443
@@ -62,31 +62,6 @@ provision:
       #!/bin/bash
       set -eux -o pipefail
       
-      # Install socat for gateway port forwarding
-      apt-get install -y --no-install-recommends socat
-
-      # Systemd services that bridge Lima's port-forwarded ports to the
-      # Cilium Gateway IP. The script polls k3s until the Gateway has an
-      # IP, then hands off to socat.
-      base64 -d > /usr/local/bin/k3s-port-forward.sh << 'EOF'
-      IyEvYmluL2Jhc2gKUE9SVD0kMQp3aGlsZSB0cnVlOyBkbwogIEdXPSQoa3ViZWN0bCAtLWt1YmVj
-      b25maWc9L2V0Yy9yYW5jaGVyL2szcy9rM3MueWFtbCBcCiAgICBnZXQgc3ZjIGNpbGl1bS1nYXRl
-      d2F5LWRldi1sb2NhbCAtbiBkZWZhdWx0IFwKICAgIC1vIGpzb25wYXRoPSd7LnNwZWMuY2x1c3Rl
-      cklQfScgMj4vZGV2L251bGwgfHwgdHJ1ZSkKICBbIC1uICIkR1ciIF0gJiYgWyAiJEdXIiAhPSAi
-      Tm9uZSIgXSAmJiBcCiAgICBleGVjIHNvY2F0ICJUQ1AtTElTVEVOOiR7UE9SVH0sZm9yayxiaW5k
-      PTAuMC4wLjAscmV1c2VhZGRyIiAiVENQOiR7R1d9OiR7UE9SVH0iCiAgc2xlZXAgNQpkb25lCg==
-      EOF
-      chmod +x /usr/local/bin/k3s-port-forward.sh
-
-      for PORT in 8080 8443; do
-        printf '[Unit]\nDescription=Forward port %s to Cilium Gateway\nAfter=k3s.service\nWants=k3s.service\n\n[Service]\nExecStart=/usr/local/bin/k3s-port-forward.sh %s\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n' \
-          "$PORT" "$PORT" > /etc/systemd/system/k3s-port-forward-${PORT}.service
-      done
-      systemctl daemon-reload
-      for PORT in 8080 8443; do
-        systemctl enable k3s-port-forward-${PORT}
-      done
-
       # systemd-logind spins at ~100% CPU in this VM (virtual input device
       # event loop issue); not needed for a headless k3s node.
       systemctl mask systemd-logind.service
@@ -100,7 +75,7 @@ provision:
       # Configure k3s registry mirror so containerd (running on the node) can
       # resolve zot.registry.svc.cluster.local:5000 — a Kubernetes DNS name only
       # resolvable inside pods, not by the node's system resolver.  We map it to
-      # the Zot NodePort (fixed at 30500 via the Zot HelmRelease service.nodePort).
+      # the Zot NodePort (fixed at 30500 via the Zot ArgoCD Application service.nodePort).
       mkdir -p /etc/rancher/k3s
       printf 'mirrors:\n  "zot.registry.svc.cluster.local:5000":\n    endpoint:\n      - "http://localhost:30500"\nconfigs:\n  "zot.registry.svc.cluster.local:5000":\n    tls:\n      insecure: true\n' \
         > /etc/rancher/k3s/registries.yaml
@@ -108,7 +83,7 @@ provision:
       # Install k3s if not already installed
       if [ ! -f /usr/local/bin/k3s ]; then
         echo "Installing k3s..."
-        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable=traefik --disable=servicelb --flannel-backend=none --disable-network-policy --disable-kube-proxy --write-kubeconfig-mode 644 --tls-san host.docker.internal" sh -
+        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable=traefik --write-kubeconfig-mode 644 --tls-san host.docker.internal" sh -
       else
         echo "k3s already installed, skipping..."
       fi
@@ -127,11 +102,6 @@ provision:
         sleep 2
       done
       
-      # Start port-forward services now that k3s is running
-      for PORT in 8080 8443; do
-        systemctl start k3s-port-forward-${PORT}
-      done
-
       # Ensure containerd socket is accessible
       chmod 666 /run/k3s/containerd/containerd.sock || true
       
